@@ -1,0 +1,1848 @@
+/* TrazaPanUSFQ - interfaz. Un solo archivo, sin librerias externas.
+   Secciones: utilidades · inicio · bodega principal · bodega secundaria · cocina · produccion y hoja · etiquetas · consulta · administrar */
+'use strict';
+
+const $vista = document.getElementById('vista');
+const $quien = document.getElementById('quien');
+
+// ------------------------------------------------------------------ utilidades
+function h(etiqueta, attrs, ...hijos) {
+  const el = document.createElement(etiqueta);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else if (k === 'class') el.className = v;
+    else if (k === 'value') el.value = v;
+    else if (k === 'checked' || k === 'disabled' || k === 'selected') el[k] = !!v;
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  const poner = (x) => {
+    if (x === null || x === undefined || x === false) return;
+    if (Array.isArray(x)) x.forEach(poner);
+    else el.append(x.nodeType ? x : document.createTextNode(String(x)));
+  };
+  hijos.forEach(poner);
+  return el;
+}
+
+let personaMemoria = '';
+function quien() {
+  try { return localStorage.getItem('trazapan_persona') || personaMemoria; } catch (e) { return personaMemoria; }
+}
+function fijarQuien(nombre) {
+  personaMemoria = nombre;
+  try { localStorage.setItem('trazapan_persona', nombre); } catch (e) { /* sin almacenamiento: queda en memoria */ }
+  pintarQuien();
+}
+function pintarQuien() { $quien.textContent = quien() ? '👤 ' + quien() : 'Elegir quién soy'; }
+
+// Contraseñas por área: requiere = el servidor pide contraseña; area = área con la sesión iniciada.
+const sesion = { requiere: false, area: null };
+const necesitaClave = () => sesion.requiere && area() && sesion.area !== area();
+
+async function api(ruta, datos) {
+  const opciones = datos === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ persona: quien() }, datos)),
+  };
+  let resp;
+  try { resp = await fetch('/api' + ruta, opciones); }
+  catch (e) { throw new Error('No hay conexión con el servidor de TrazaPanUSFQ. Revisa el wifi.'); }
+  const json = await resp.json().catch(() => ({ error: 'El servidor respondió algo inesperado.' }));
+  if (resp.status === 401 && json.login) {
+    // La sesión del área terminó (o nunca se inició): se vuelve a pedir la contraseña.
+    if (sesion.area) { sesion.area = null; setTimeout(navegar, 0); }
+    throw new Error('Escribe la contraseña del área para continuar.');
+  }
+  if (!resp.ok) throw new Error(json.error || 'Error ' + resp.status);
+  return json;
+}
+
+function avisar(texto, tipo) {
+  const el = h('div', { class: 'aviso-flotante ' + (tipo || '') }, texto);
+  document.getElementById('avisos').append(el);
+  setTimeout(() => el.remove(), tipo === 'error' ? 7000 : 3000);
+}
+// Ejecuta una accion y muestra el error si falla.
+async function intentar(fn) {
+  try { return await fn(); } catch (e) { avisar(e.message, 'error'); return undefined; }
+}
+
+// Ventana emergente. Tocar fuera NO la cierra: solo sus botones, o la X si no es obligatoria.
+// obligatoria = true: hay que elegir uno de los botones (sin X ni tecla Esc).
+function modal(titulo, contenido, botones, obligatoria) {
+  return new Promise((resolver) => {
+    const cerrar = (valor) => { document.removeEventListener('keydown', alTeclear); velo.remove(); resolver(valor); };
+    const alTeclear = (e) => { if (e.key === 'Escape' && !obligatoria) cerrar(null); };
+    const caja = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' },
+      obligatoria ? null : h('button', { class: 'cerrar-modal', type: 'button', 'aria-label': 'Cancelar', title: 'Cancelar', onclick: () => cerrar(null) }, '×'),
+      h('h2', null, titulo), contenido,
+      (botones || []).map((b) => h('button', { class: 'boton ' + (b.clase || ''), type: 'button',
+        onclick: () => cerrar(typeof b.valor === 'function' ? b.valor() : b.valor) }, b.texto)));
+    const velo = h('div', { class: 'velo' }, caja);
+    document.addEventListener('keydown', alTeclear);
+    document.body.append(velo);
+  });
+}
+function confirmar(titulo, texto, textoSi) {
+  return modal(titulo, h('p', null, texto), [{ texto: textoSi || 'Sí', clase: 'principal', valor: true }, { texto: 'Cancelar', valor: null }]);
+}
+function pedirTexto(titulo, etiqueta, valorInicial) {
+  const campo = h('input', { type: 'text', value: valorInicial || '' });
+  setTimeout(() => campo.focus(), 50);
+  return modal(titulo, h('div', null, h('label', null, etiqueta), campo),
+    [{ texto: 'Aceptar', clase: 'principal', valor: () => campo.value.trim() }, { texto: 'Cancelar', valor: null }]);
+}
+
+const dia = (f) => (f && /^\d{4}-\d{2}-\d{2}/.test(f) ? f.slice(8, 10) + '/' + f.slice(5, 7) + '/' + f.slice(0, 4) : (f || ''));
+const hora = (f) => (f ? f.slice(8, 10) + '/' + f.slice(5, 7) + ' ' + f.slice(11, 16) : '');
+const NOMBRE_ESTADO = { en_curso: 'En curso', por_completar: 'Por completar', completa: 'Completa', anulada: 'Anulada' };
+const CLASE_ESTADO = { en_curso: 'aviso', por_completar: 'rojo', completa: 'verde', anulada: 'gris' };
+
+const num = (x) => String(Math.round(Number(x) * 1000) / 1000);
+
+// Semáforo de caducidad: rojo = caducado, amarillo = por caducar, verde = con buen tiempo. El texto dice lo mismo que el color.
+function semaforo(l) {
+  if (!l.semaforo) return null;
+  const d = l.dias_caducidad;
+  const texto = l.semaforo === 'rojo' ? 'Caducado el ' + dia(l.caducidad)
+    : l.semaforo === 'amarillo' ? (d === 0 ? 'Caduca hoy' : d === 1 ? 'Caduca mañana' : 'Caduca en ' + d + ' días') + ' (' + dia(l.caducidad) + ')'
+      : 'Caduca el ' + dia(l.caducidad);
+  return h('span', { class: 'semaforo ' + l.semaforo }, h('i'), texto);
+}
+
+// Dar de baja un lote (o parte) por caducado o contaminado. lugar: principal, secundaria o cocina.
+// disponible: lo que queda en ese lugar (se propone darlo todo de baja); en cocina la cantidad es opcional.
+async function darDeBaja(l, lugar, disponible) {
+  const u = l.unidad || 'unidades';
+  const motivo = segmento([['CADUCADO', 'Caducado'], ['CONTAMINADO', 'Contaminado']], l.semaforo === 'rojo' ? 'CADUCADO' : '');
+  const cantidad = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: disponible != null ? num(Math.max(disponible, 0)) : '',
+    placeholder: lugar === 'cocina' ? 'Opcional' : 'Solo números',
+    oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; } });
+  const comentario = h('input', { type: 'text', placeholder: 'Qué pasó (opcional)' });
+  const nombres = { principal: 'bodega principal', secundaria: 'bodega secundaria', cocina: 'cocina' };
+  const d = await modal('Dar de baja', h('div', null,
+    h('p', { style: 'margin-top:0' }, h('b', null, l.ingrediente), ' | ', h('b', { class: 'mono' }, l.lote), ' ', semaforo(l)),
+    h('label', null, 'Motivo'), motivo.el,
+    h('label', null, '¿Cuántas ' + u + ' se sacan de ' + nombres[lugar] + '?'), cantidad,
+    disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + num(Math.max(disponible, 0)) + ' ' + u + '.') : null,
+    h('label', null, 'Comentario'), comentario),
+  [{ texto: 'Dar de baja', clase: 'peligro-lleno', valor: () => ({ lote_id: l.id, lugar, motivo: motivo.valor, cantidad: cantidad.value.trim(), comentario: comentario.value.trim() }) },
+    { texto: 'Cancelar', valor: null }]);
+  if (!d) return false;
+  const r = await api('/bajas', d);
+  avisar('Lote ' + l.lote + ' dado de baja' + (r.vacio ? '' : ' (parcial)'), 'bien');
+  return true;
+}
+
+// Sección "semáforo" (bodega principal y bodega secundaria): orden por urgencia, resumen de colores y tarjeta corta.
+const ORDEN_SEM = { rojo: 0, amarillo: 1, verde: 2 };
+const ordenarSemaforo = (lotes) => [...lotes].sort((a, b) => (ORDEN_SEM[a.semaforo] ?? 3) - (ORDEN_SEM[b.semaforo] ?? 3)
+  || String(a.caducidad || '9999').localeCompare(String(b.caducidad || '9999')) || String(a.ingrediente).localeCompare(String(b.ingrediente)));
+function leyendaSemaforo(lotes) {
+  const cuenta = (c) => lotes.filter((l) => l.semaforo === c).length;
+  return h('p', { class: 'leyenda' },
+    h('span', { class: 'semaforo rojo' }, h('i'), cuenta('rojo') + ' caducado'), ' ',
+    h('span', { class: 'semaforo amarillo' }, h('i'), cuenta('amarillo') + ' por caducar'), ' ',
+    h('span', { class: 'semaforo verde' }, h('i'), cuenta('verde') + ' con buen tiempo'));
+}
+// nombre y lote en negrilla; cantidad disponible y proveedor; caducidad con su color.
+function tarjetaSemaforo(l, nombre, disponible, acciones, foto) {
+  const u = l.unidad ? ' ' + l.unidad : '';
+  return h('div', { class: 'lote borde-' + (l.semaforo || 'sin') },
+    foto !== undefined ? fotoProducto(foto, nombre, 'en-lote') : null,
+    h('div', { class: 'datos' },
+      h('div', { class: 'titulo-lote' }, h('b', null, nombre), h('span', { class: 'separador' }, '|'), h('b', { class: 'mono' }, l.lote)),
+      h('div', { class: 'chico' }, disponible != null ? ['Quedan ', h('b', null, num(Math.max(disponible, 0)) + u)] : h('span', { class: 'suave' }, 'Cantidad sin registrar'),
+        l.proveedor ? h('span', { class: 'suave' }, ' · ' + l.proveedor) : null),
+      h('div', null, semaforo(l) || h('span', { class: 'etq gris' }, 'Sin fecha de caducidad'))),
+    acciones ? h('div', { class: 'acciones-lote' }, acciones) : null);
+}
+function buscadorLotes(caja, valor, alCambiar) {
+  return h('input', { type: 'search', placeholder: 'Buscar por nombre o lote', value: valor,
+    oninput: (e) => { const pos = e.target.selectionStart; alCambiar(e.target.value);
+      const nuevo = caja.querySelector('input[type=search]'); if (nuevo) { nuevo.focus(); nuevo.setSelectionRange(pos, pos); } } });
+}
+
+function tarjetaLote(l, opc) {
+  opc = opc || {};
+  const u = l.unidad ? ' ' + l.unidad : '';
+  const cad = l.caducidad && !l.semaforo ? 'caduca ' + dia(l.caducidad) : null;     // si hay semáforo, la fecha va ahí
+  const detalle = opc.cocina ? (l.disponible_cocina != null ? 'Quedan ' + num(Math.max(l.disponible_cocina, 0)) + u + ' en bodega secundaria' : '')
+    : opc.breve ? [l.producto_bodega, l.proveedor, cad,
+    opc.saldo && l.disponible != null ? 'quedan ' + num(Math.max(l.disponible, 0)) + u : null].filter((x, i) => x && !(opc.saldo && i === 0)).join(' · ')
+    : [l.producto_bodega, l.proveedor, l.fecha_ingreso && 'ingresó ' + dia(l.fecha_ingreso),
+    l.recibido != null ? 'recibido ' + num(l.recibido) + u : l.cantidad,
+    l.trasladado ? 'pasó a secundaria ' + num(l.trasladado) + u : null,
+    l.disponible != null && !l.principal_vacio && (l.trasladado || l.a_cocina) ? 'quedan en principal ' + num(l.disponible) + u : null,
+    l.disponible_cocina != null ? 'quedan en secundaria ' + num(Math.max(l.disponible_cocina, 0)) + u : null,
+    l.a_cocina ? 'tomado por cocina ' + num(l.a_cocina) + u : null,
+    cad].filter(Boolean).join(' · ');
+  const el = h('div', { class: 'lote' + (opc.elegible ? ' elegible' : '') + (opc.marcado ? ' marcado' : '') },
+    opc.elegible ? h('div', { class: 'caja' }, opc.marcado ? '✓' : '') : null,
+    h('div', { class: 'datos' },
+      opc.conIngrediente ? h('div', { class: 'chico suave' }, l.ingrediente) : null,
+      h('div', { class: 'codigo' }, l.lote),
+      detalle ? h('div', { class: 'chico suave' }, detalle) : null,
+      opc.cocina ? h('div', null, semaforo(l)) : h('div', null,
+        semaforo(l), ' ',
+        l.abierto_en ? h('span', { class: 'etq verde' }, 'Abierto en cocina desde ' + hora(l.abierto_en)) : null, ' ',
+        l.origen === 'manual' ? h('span', { class: 'etq rojo' }, 'Anotado a mano') : null, ' ',
+        l.origen === 'interno' ? h('span', { class: 'etq gris' }, 'Hecho en la panadería') : null, ' ',
+        l.revisar ? h('span', { class: 'etq aviso' }, 'Por revisar') : null, ' ',
+        l.agotado ? h('span', { class: 'etq gris' }, 'Agotado') : null),
+      l.revisar && l.nota && opc.conNota ? h('div', { class: 'chico suave' }, l.nota) : null),
+    opc.acciones || null);
+  if (opc.elegible && opc.alTocar) el.addEventListener('click', opc.alTocar);
+  return el;
+}
+
+// Al abrir un lote nuevo, pregunta que paso con los que ya estaban abiertos del mismo ingrediente.
+// Nombre del recipiente: "recipiente 2 de HARINA DE TRIGO", "recipiente de SAL" o "empaque de MANTEQUILLA".
+const nombreRecipiente = (g) => (g.n_recipientes === 0 ? 'empaque' : g.n_recipientes > 1 ? 'recipiente ' + g.recipiente : 'recipiente');
+const listaLotes = (lotes) => lotes.map((l) => l.lote).join(', ');
+
+// Despues de poner un lote nuevo: ¿lo anterior sigue ahi (se mezclo) o el recipiente estaba vacio?
+async function preguntarAnteriores(grupos) {
+  for (const g of grupos || []) {
+    const ing = g.ingrediente;
+    let quedan = g.lotes.length;
+    if (g.anteriores.length) {
+      const empaque = g.n_recipientes === 0;
+      const cosa = empaque ? 'empaque' : 'recipiente';
+      const cual = g.n_recipientes > 1 ? 'El recipiente ' + g.recipiente + ' de ' + ing : 'El ' + cosa + ' anterior de ' + ing;
+      const r = await modal('¿' + cual + ' se acabó?',
+      h('div', null, h('p', null, 'Lote anterior: ', h('b', { class: 'mono' }, listaLotes(g.anteriores))),
+        h('p', { class: 'suave' }, 'Lote nuevo: ', h('b', { class: 'mono' }, listaLotes(g.nuevos)))),
+      [{ texto: 'Sí, empezamos con un ' + cosa + ' nuevo', clase: 'principal', valor: 'vacio' },
+        { texto: empaque ? 'No, seguimos usando los dos lotes' : 'No, mezclamos ambos lotes', valor: 'mezcla' }], true);
+      if (r === 'vacio') {
+        await intentar(() => api('/cocina/vaciar', { ingrediente_id: g.ingrediente_id, recipiente: g.recipiente, lote_ids: g.anteriores.map((l) => l.id) }));
+        quedan = g.nuevos.length;
+      }
+    }
+    if (g.n_recipientes !== 0 && quedan > 3) await avisoMezcla(g, quedan);
+  }
+}
+
+function avisoMezcla(g, n) {
+  return modal('Muchos lotes mezclados',
+    h('div', null, h('p', null, 'El ' + nombreRecipiente(g) + ' de ', h('b', null, g.ingrediente), ' tiene ahora ', h('b', null, n + ' lotes mezclados'), '.'),
+      h('p', { class: 'suave' }, 'Lo recomendado es vaciarlo y limpiarlo antes de volver a llenarlo: si hay un problema con cualquiera de estos lotes, habría que retirar todo lo producido mientras estuvo en el recipiente.')),
+    [{ texto: 'Entendido', clase: 'principal', valor: true }], true);
+}
+
+async function elegirPersona() {
+  const personas = await intentar(() => api('/personas')) || [];
+  const campo = h('input', { type: 'text', placeholder: 'Nombre y apellido' });
+  const elegido = await modal('¿Quién eres?',
+    h('div', null,
+      h('p', { class: 'suave' }, 'Tu nombre queda guardado en cada registro que hagas desde este dispositivo.'),
+      personas.map((p) => h('button', { class: 'boton ancho', style: 'margin-top:.5rem', type: 'button',
+        onclick: (e) => { campo.value = p.nombre; e.target.closest('.velo').querySelector('.principal').click(); } },
+      p.nombre, p.rol ? h('span', { class: 'suave chico' }, ' · ' + p.rol) : null)),
+      h('label', null, 'No estoy en la lista'), campo),
+    [{ texto: 'Continuar', clase: 'principal', valor: () => campo.value.trim() }], true);
+  if (elegido) {
+    if (!personas.some((p) => p.nombre === elegido)) await intentar(() => api('/personas', { nombre: elegido }));
+    fijarQuien(elegido);
+  }
+}
+$quien.addEventListener('click', elegirPersona);
+
+function reducirFoto(archivo) {   // achica la foto a 1600 px para no llenar el disco
+  return new Promise((resolver) => {
+    const img = new Image();
+    img.onload = () => {
+      const escala = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const lienzo = h('canvas', { width: Math.round(img.width * escala), height: Math.round(img.height * escala) });
+      lienzo.getContext('2d').drawImage(img, 0, 0, lienzo.width, lienzo.height);
+      lienzo.toBlob((b) => resolver(b), 'image/jpeg', 0.8);
+    };
+    img.onerror = () => resolver(null);
+    img.src = URL.createObjectURL(archivo);
+  });
+}
+
+// Foto: abre la cámara (la del celular, o la de la computadora si tiene) o permite subir un archivo.
+function campoFoto() {
+  let archivo = null;
+  let flujo = null;
+  const subir = h('input', { type: 'file', accept: 'image/*', hidden: true });
+  const camaraCel = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
+  const video = h('video', { autoplay: true, playsinline: true, muted: true, class: 'camara-video' });
+  const zonaCamara = h('div', { class: 'camara', hidden: true });
+  const vista = h('div', { class: 'foto-elegida', hidden: true });
+  const botones = h('div', { class: 'fila-botones', style: 'margin-top:.3rem' });
+  const apagar = () => { if (flujo) flujo.getTracks().forEach((t) => t.stop()); flujo = null; zonaCamara.hidden = true; botones.hidden = false; };
+  const poner = (blob) => {
+    archivo = blob;
+    apagar();
+    vista.replaceChildren(h('img', { src: URL.createObjectURL(blob), alt: 'Foto del empaque' }),
+      h('button', { class: 'boton chico', type: 'button', onclick: () => { archivo = null; vista.hidden = true; } }, 'Quitar foto'));
+    vista.hidden = false;
+  };
+  subir.addEventListener('change', () => { if (subir.files[0]) poner(subir.files[0]); subir.value = ''; });
+  camaraCel.addEventListener('change', () => { if (camaraCel.files[0]) poner(camaraCel.files[0]); camaraCel.value = ''; });
+  const abrirCamara = async () => {
+    // En la computadora (localhost) se usa la cámara en vivo; en el celular, la cámara del teléfono.
+    const movil = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    if (movil || !window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { camaraCel.click(); return; }
+    try {
+      flujo = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    } catch (e) {
+      avisar('No se pudo abrir la cámara. Puedes subir la foto como archivo.');
+      return;
+    }
+    video.srcObject = flujo;
+    zonaCamara.hidden = false; botones.hidden = true;
+  };
+  const capturar = () => {
+    const lienzo = h('canvas', { width: video.videoWidth || 1280, height: video.videoHeight || 720 });
+    lienzo.getContext('2d').drawImage(video, 0, 0, lienzo.width, lienzo.height);
+    lienzo.toBlob((b) => { if (b) poner(b); }, 'image/jpeg', 0.85);
+  };
+  zonaCamara.append(video, h('div', { class: 'fila-botones' },
+    h('button', { class: 'boton principal', type: 'button', onclick: capturar }, 'Tomar la foto'),
+    h('button', { class: 'boton', type: 'button', onclick: apagar }, 'Cerrar cámara')));
+  botones.append(
+    h('button', { class: 'boton', type: 'button', onclick: abrirCamara }, '📷 Tomar foto'),
+    h('button', { class: 'boton', type: 'button', onclick: () => subir.click() }, 'Subir archivo'));
+  return { el: h('div', null, botones, zonaCamara, vista, subir, camaraCel), get archivo() { return archivo; }, apagar };
+}
+
+// "No encuentro el lote en la lista"
+async function loteManual(ing, destino) {
+  const codigo = h('input', { type: 'text', autocapitalize: 'characters', autocomplete: 'off' });
+  const nota = h('input', { type: 'text', placeholder: 'Opcional' });
+  const foto = campoFoto();
+  const datos = await modal('Lote que no está en la lista',
+    h('div', null,
+      h('div', { class: 'nota' }, 'Úsalo solo si de verdad no aparece. Queda marcado «por revisar» hasta que bodega principal lo registre.'),
+      h('p', null, 'Ingrediente: ', h('b', null, ing.nombre)),
+      h('label', null, 'Código de lote, exactamente como está en el empaque'), codigo,
+      h('label', null, 'Foto del empaque donde se ve el lote'), foto.el,
+      h('label', null, 'Comentario'), nota),
+    [{ texto: 'Registrar', clase: 'principal', valor: () => ({ lote: codigo.value.trim(), nota: nota.value.trim(), archivo: foto.archivo }) },
+      { texto: 'Cancelar', valor: null }]);
+  foto.apagar();
+  if (!datos) return false;
+  const r = await intentar(() => api('/lotes/manual', { ingrediente_id: ing.id, lote: datos.lote, nota: datos.nota, destino }));
+  if (!r) return false;
+  if (datos.archivo) {
+    const blob = await reducirFoto(datos.archivo);
+    if (blob) await intentar(async () => {
+      const resp = await fetch('/api/lotes/' + r.lote_id + '/foto', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: blob });
+      if (!resp.ok) throw new Error('El lote se registró, pero la foto no se pudo guardar.');
+    });
+  }
+  avisar('Lote registrado y marcado por revisar. Se avisó a bodega principal y a producción.', 'bien');
+  revisarAvisos(true);
+  await preguntarAnteriores(r.anteriores);
+  return true;
+}
+
+function encabezado(titulo, subtitulo) {
+  return [h('a', { class: 'volver no-imprimir', href: '#/' }, '← Inicio'), h('h1', null, titulo),
+    subtitulo ? h('p', { class: 'suave' }, subtitulo) : null];
+}
+// Pone en cada celda el titulo de su columna, para mostrar las tablas como fichas en el celular.
+function rotular(raiz) {
+  raiz.querySelectorAll('table').forEach((t) => {
+    const titulos = [...t.querySelectorAll(':scope > thead th')].map((th) => th.textContent);
+    t.querySelectorAll(':scope > tbody > tr').forEach((tr) => {
+      const celdas = [...tr.children];
+      if (celdas.length === titulos.length) celdas.forEach((td, i) => { if (titulos[i]) td.setAttribute('data-t', titulos[i]); });
+    });
+  });
+}
+function llenar(el, ...nodos) {
+  el.replaceChildren();
+  nodos.flat(Infinity).forEach((n) => { if (n) el.append(n.nodeType ? n : document.createTextNode(String(n))); });
+  rotular(el);
+}
+function pintar(...nodos) { llenar($vista, ...nodos); window.scrollTo(0, 0); }
+
+// ------------------------------------------------------------------ inicio
+// Areas de trabajo. Cada dispositivo recuerda su area; mas adelante cada area tendra su contrasena.
+const AREAS = {
+  bodega: { nombre: 'Bodega principal', texto: 'Recepción de proveedores y paso a otras áreas', secciones: ['bodega', 'salidas'] },
+  produccion: { nombre: 'Producción', texto: 'Bodega secundaria, hojas de producción, etiquetas, consultas y administración',
+    secciones: ['secundaria', 'hojas', 'etiquetas', 'consulta', 'admin'] },
+  cocina: { nombre: 'Cocina', texto: 'Abrir lotes y avisar qué pan empieza y termina', secciones: ['cocina', 'produccion'] },
+};
+let areaMemoria = '';
+function area() {
+  let a = areaMemoria;
+  try { a = localStorage.getItem('trazapan_area') || areaMemoria; } catch (e) { /* sin almacenamiento */ }
+  return AREAS[a] ? a : '';
+}
+function fijarArea(a) {
+  areaMemoria = a;
+  try { if (a) localStorage.setItem('trazapan_area', a); else localStorage.removeItem('trazapan_area'); } catch (e) { /* queda en memoria */ }
+  pintarArea();
+}
+const $area = h('button', { class: 'chip-persona', type: 'button', onclick: () => cambiarArea() });
+// Cambiar de área: si hay contraseñas, se cierra la sesión para que la otra área escriba la suya.
+async function cambiarArea() {
+  if (sesion.requiere) { try { await fetch('/api/salir', { method: 'POST' }); } catch (e) { /* sin conexión */ } sesion.area = null; }
+  fijarArea(''); location.hash = '#/'; navegar();
+}
+$quien.before($area);
+function pintarArea() { $area.textContent = area() ? AREAS[area()].nombre + ' ⇄' : ''; $area.hidden = !area(); revisarAvisos(); }
+
+// Avisos para bodega principal y producción (por ejemplo, un lote anotado a mano). Se revisan cada 30 segundos.
+const AREAS_CON_AVISOS = ['bodega', 'produccion'];
+let avisosPendientes = [];
+let avisosVistos = null;
+const $campana = h('button', { class: 'chip-persona chip-aviso', type: 'button', hidden: true, onclick: () => verAvisos() });
+$quien.before($campana);
+async function revisarAvisos(silencio) {   // silencio: no mostrar como nuevo lo que acaba de crear este dispositivo
+  if (!AREAS_CON_AVISOS.includes(area()) || necesitaClave()) { avisosPendientes = []; $campana.hidden = true; return; }
+  let lista;
+  try { lista = await api('/avisos?area=' + area()); } catch (e) { return; }
+  avisosPendientes = lista;
+  $campana.textContent = '🔔 ' + lista.length;
+  $campana.hidden = !lista.length;
+  const nuevos = lista.filter((a) => avisosVistos && !avisosVistos.has(a.id));
+  if (nuevos.length && silencio !== true) avisar('Nuevo aviso: ' + nuevos[0].texto);
+  avisosVistos = new Set(lista.map((a) => a.id));
+  const caja = document.getElementById('avisos-inicio');
+  if (caja) pintarAvisosInicio(caja);
+}
+setInterval(revisarAvisos, 30000);
+function pintarAvisosInicio(caja) {
+  const n = avisosPendientes.length;
+  caja.replaceChildren(...(n ? [h('button', { class: 'nota rojo aviso-inicio', type: 'button', onclick: () => verAvisos() },
+    h('b', null, '🔔 ' + (n === 1 ? '1 aviso por revisar' : n + ' avisos por revisar')), h('div', { class: 'chico' }, avisosPendientes[0].texto))] : []));
+}
+async function verAvisos() {
+  const cont = h('div', null);
+  const dibujar = () => {
+    cont.replaceChildren(...(avisosPendientes.length ? avisosPendientes.map((a) => {
+      const resp = h('input', { type: 'text', placeholder: 'Qué pasó (opcional)' });
+      return h('div', { class: 'tarjeta', style: 'margin:.6rem 0' },
+        h('p', { style: 'margin-top:0' }, a.texto),
+        h('div', { class: 'chico suave' }, hora(a.creado_en)),
+        a.foto ? h('p', null, h('a', { href: '/fotos/' + a.foto, target: '_blank' }, 'Ver foto del empaque')) : null,
+        resp,
+        h('button', { class: 'boton ok', type: 'button', style: 'margin-top:.5rem', onclick: () => intentar(async () => {
+          await api('/avisos/' + a.id + '/revisado', { comentario: resp.value.trim() });
+          avisar('Aviso marcado como revisado', 'bien');
+          await revisarAvisos();
+          dibujar();
+        }) }, 'Ya lo revisé'));
+    }) : [h('p', { class: 'suave' }, 'No hay avisos pendientes.')]));
+  };
+  await revisarAvisos();
+  dibujar();
+  await modal('Avisos de ' + AREAS[area()].nombre.toLowerCase(), cont, [{ texto: 'Cerrar', valor: null }]);
+}
+
+async function vistaInicio() {
+  if (!area()) {
+    pintar(h('div', { class: 'nombre-app nombre-inicio' }, 'Traza', h('b', null, 'Pan'), 'USFQ'),
+      h('h1', null, 'Hola' + (quien() ? ', ' + quien().split(' ')[0] : '')),
+      h('p', { class: 'suave' }, '¿En qué área estás? Este dispositivo lo recordará.'),
+      h('div', { class: 'mosaicos areas' }, Object.entries(AREAS).map(([id, a]) => h('button', { class: 'mosaico', type: 'button',
+        onclick: () => { fijarArea(id); navegar(); } }, h('b', null, a.nombre), h('small', null, a.texto)))));
+    return;
+  }
+  const e = await api('/estado');
+  const pendientes = e.alias_por_asignar + e.lotes_revisar;
+  const mosaico = (ruta, titulo, texto, numero, clase) => h('a', { class: 'mosaico', href: ruta },
+    numero ? h('span', { class: 'num ' + (clase || '') }, numero) : null, h('b', null, titulo), h('small', null, texto));
+  const SECCIONES = {
+    bodega: () => mosaico('#/bodega', 'Bodega principal', 'Registrar lo que llega de los proveedores', e.recepciones_hoy ? e.recepciones_hoy + ' hoy' : 0, 'verde'),
+    salidas: () => mosaico('#/salidas', 'Paso a otras áreas', 'Pastelería, carnicería y caducidad',
+      e.caducados_principal ? e.caducados_principal + ' caducado(s)' : e.por_caducar_principal ? e.por_caducar_principal + ' por caducar' : 0,
+      e.caducados_principal ? 'rojo' : 'amarillo'),
+    secundaria: () => mosaico('#/secundaria', 'Bodega secundaria', 'Registrar los lotes que llegan desde bodega principal'),
+    cocina: () => mosaico('#/cocina', 'Cocina', 'Abrir un lote nuevo o avisar que se terminó', e.abiertos, 'verde'),
+    produccion: () => mosaico('#/produccion', 'Producción', 'Avisar qué pan empieza y cuándo termina', e.en_curso ? e.en_curso + ' en curso' : 0),
+    hojas: () => mosaico('#/hojas', 'Hojas de producción', 'Ver lo que se está produciendo y completar las hojas',
+      e.por_completar ? e.por_completar + ' por completar' : 0, 'rojo'),
+    etiquetas: () => mosaico('#/etiquetas', 'Etiquetas', 'Lotes del día para imprimir en la Zebra'),
+    consulta: () => mosaico('#/consulta', 'Consultar', 'Rastrear un lote de pan o de ingrediente'),
+    admin: () => mosaico('#/admin', 'Administrar', 'Importar Excel, pendientes, recetas y personas', pendientes, 'rojo'),
+  };
+  const a = AREAS[area()];
+  pintar(
+    h('div', { class: 'nombre-app nombre-inicio' }, 'Traza', h('b', null, 'Pan'), 'USFQ'),
+    h('h1', null, 'Hola' + (quien() ? ', ' + quien().split(' ')[0] : '')),
+    h('p', { class: 'suave' }, 'Área: ', h('b', null, a.nombre)),
+    AREAS_CON_AVISOS.includes(area()) ? h('div', { id: 'avisos-inicio' }) : null,
+    h('div', { class: 'mosaicos' }, a.secciones.map((sec) => SECCIONES[sec]())),
+    h('div', { class: 'fila-botones' }, h('button', { class: 'boton chico', type: 'button', onclick: () => cambiarArea() }, 'Cambiar de área')));
+  const caja = document.getElementById('avisos-inicio');
+  if (caja) { pintarAvisosInicio(caja); revisarAvisos(); }
+}
+
+// ------------------------------------------------------------------ bodega principal
+const normal = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()
+  .replace(/[^A-Z0-9]+/g, ' ').replace(/(?<=[A-Z])(?=[0-9])|(?<=[0-9])(?=[A-Z])/g, ' ').replace(/\s+/g, ' ').trim();
+const iniciales = (nombre) => String(nombre || '').trim().split(/\s+/).filter(Boolean).map((p) => p[0]).join('').toUpperCase().slice(0, 3);
+// Detecta celdas con varios lotes juntos ("284907 - 287803", "5294681/ 5306721", "L#28 Y L#30").
+const variosLotes = (t) => /\s[-/&]\s*\S|\S\s*[/&]\s|\s[yY]\s|[,;]/.test(t || '');
+
+// Deja solo dígitos y un separador decimal (punto o coma).
+const soloNumero = (t) => {
+  const limpio = String(t).replace(/[^0-9.,]/g, '');
+  const i = limpio.search(/[.,]/);
+  return i < 0 ? limpio : limpio.slice(0, i + 1) + limpio.slice(i + 1).replace(/[.,]/g, '');
+};
+
+function paginaHorizontal(si) {
+  const previa = document.getElementById('pagina-horizontal');
+  if (previa) previa.remove();
+  if (si) document.head.append(h('style', { id: 'pagina-horizontal' }, '@page { size: A4 landscape; margin: 10mm; }'));
+}
+
+function segmento(opciones, inicial, alCambiar) {
+  let valor = inicial || '';
+  const el = h('div', { class: 'segmento' });
+  const dibujar = () => el.replaceChildren(...opciones.map(([v, texto, clase]) => h('button', {
+    type: 'button', class: valor === v ? 'activo ' + (clase || '') : '',
+    onclick: () => { valor = v; dibujar(); if (alCambiar) alCambiar(v); } }, texto)));
+  dibujar();
+  return { el, get valor() { return valor; }, set valor(v) { valor = v || ''; dibujar(); } };
+}
+
+// Foto de un producto (sin fondo). Si no hay foto, un círculo con la inicial.
+function fotoProducto(url, nombre, clase) {
+  return url ? h('img', { class: 'foto-prod ' + (clase || ''), src: url, alt: '', loading: 'lazy' })
+    : h('span', { class: 'foto-prod sin-foto ' + (clase || '') }, String(nombre || '?').trim().charAt(0));
+}
+
+// Campo que solo acepta valores de una lista fija: se escribe una parte para filtrar y se elige.
+// opciones() devuelve la lista actual; texto(o) el nombre que se muestra.
+function listaFija({ opciones, texto, placeholder, vacio, aviso, alElegir, inicial, alAgregar, foto }) {
+  const input = h('input', { type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: placeholder || '' });
+  // Con fotos, la lista se muestra como cuadrícula de productos y el elegido lleva su foto en el campo.
+  const lista = h('div', { class: 'combo-lista' + (foto ? ' rejilla-fotos' : ''), hidden: true });
+  const miniatura = h('span', { class: 'combo-foto', hidden: true });
+  const pintarMiniatura = () => {
+    if (!foto) return;
+    miniatura.replaceChildren(...(elegido ? [fotoProducto(foto(elegido), texto(elegido))] : []));
+    miniatura.hidden = !elegido; input.classList.toggle('con-foto', !!elegido);
+  };
+  const avisoEl = h('div', { class: 'chico', style: 'color:var(--alerta)' });
+  let elegido = null;
+  let activo = -1;
+  const coincidencias = () => {
+    const n = elegido !== null ? '' : normal(input.value);    // con un valor ya elegido se muestra toda la lista
+    return opciones().filter((o) => !n || normal(texto(o)).includes(n));
+  };
+  const mostrar = () => {
+    const ops = coincidencias();
+    activo = Math.min(activo, ops.length - 1);
+    lista.replaceChildren(...(ops.length ? ops.map((o, i) => h('button', { type: 'button', class: i === activo ? 'activo' : '',
+      onpointerdown: (e) => e.preventDefault(), onclick: () => elegir(o) }, foto ? [fotoProducto(foto(o), texto(o)), h('span', null, texto(o))] : texto(o)))
+      : [h('div', { class: 'combo-vacio' }, vacio), alAgregar ? h('button', { type: 'button', class: 'combo-agregar',
+        onpointerdown: (e) => e.preventDefault(), onclick: () => { lista.hidden = true; alAgregar(); } }, '+ Agregar «' + input.value.trim().toUpperCase() + '» a la lista') : null]));
+    lista.hidden = false;
+  };
+  const elegir = (o) => {
+    elegido = o;
+    input.value = o === null ? '' : texto(o);
+    lista.hidden = true;
+    avisoEl.textContent = '';
+    pintarMiniatura();
+    if (o !== null && alElegir) alElegir(o);
+  };
+  input.addEventListener('input', () => { elegido = null; activo = -1; pintarMiniatura(); mostrar(); });
+  input.addEventListener('focus', mostrar);
+  input.addEventListener('keydown', (e) => {
+    const ops = coincidencias();
+    if (e.key === 'ArrowDown') { activo = Math.min(activo + 1, ops.length - 1); mostrar(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { activo = Math.max(activo - 1, 0); mostrar(); e.preventDefault(); }
+    else if (e.key === 'Enter') { e.preventDefault(); const o = ops[activo] || (ops.length === 1 ? ops[0] : null); if (o) elegir(o); }
+    else if (e.key === 'Escape') lista.hidden = true;
+  });
+  input.addEventListener('blur', () => {
+    lista.hidden = true;
+    if (elegido !== null || !input.value.trim()) return;
+    const exacto = opciones().find((o) => normal(texto(o)) === normal(input.value));
+    if (exacto) elegir(exacto); else avisoEl.textContent = aviso;
+  });
+  if (inicial) { elegido = inicial; input.value = texto(inicial); }
+  pintarMiniatura();
+  return {
+    input, aviso: avisoEl,
+    el: h('div', { class: 'combo' }, miniatura, input, lista),
+    get elegido() { return elegido; },
+    elegir, limpiar: () => { elegido = null; input.value = ''; avisoEl.textContent = ''; pintarMiniatura(); },
+  };
+}
+
+// Formulario con los campos del registro BPM-SFFS-RRMP001. Se usa para registrar y para corregir.
+function formRecepcion(cat, ini, editar) {
+  ini = ini || {};
+  const c = {
+    fecha: h('input', { type: 'date', value: ini.fecha_ingreso || cat.hoy }),
+    producto: editar ? h('input', { type: 'text', value: ini.producto, disabled: true }) : null,
+    proveedor: h('input', { type: 'text', autocomplete: 'off', value: ini.proveedor || '' }),
+    lote: h('input', { type: 'text', class: 'mono', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false',
+      value: ini.lote_texto || '', disabled: !!(editar && ini.en_uso) }),
+    cantidad: h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: ini.cantidad || '', placeholder: 'Solo números',
+      oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; } }),
+    caducidad: h('input', { type: 'date', value: /^\d{4}-\d{2}-\d{2}$/.test(ini.caducidad || '') ? ini.caducidad : '' }),
+    aprobado: h('input', { type: 'text', autocomplete: 'off', value: editar ? (ini.aprobado_por || '') : iniciales(quien()) }),
+    observaciones: h('input', { type: 'text', value: ini.observaciones || '' }),
+  };
+  const algoMal = () => apariencia.valor === 'NO OK' || transporte.valor === 'NO OK';
+  const revisar = () => { cajaDecision.hidden = !algoMal(); };
+  const apariencia = segmento([['OK', 'OK', 'verde'], ['NO OK', 'NO OK', 'rojo']], ini.apariencia, revisar);
+  const transporte = segmento([['OK', 'OK', 'verde'], ['NO OK', 'NO OK', 'rojo']], ini.transporte, revisar);
+  const decision = segmento([['aceptado', 'Se recibió con observación'], ['rechazado', 'Se rechazó', 'rojo']],
+    ini.rechazado ? 'rechazado' : (ini.apariencia === 'NO OK' || ini.transporte === 'NO OK') ? 'aceptado' : '');
+  const cajaDecision = h('div', { class: 'nota rojo' }, h('b', null, 'Algo no está OK. ¿Qué se hizo con el producto?'),
+    h('div', { style: 'margin-top:.4rem' }, decision.el),
+    h('div', { class: 'chico', style: 'margin-top:.3rem' }, 'Si se rechazó, el lote queda en el registro pero no pasa a la panadería. Escribe la observación.'));
+  revisar();
+
+  // Unidad: solo de la lista de unidades (al corregir se conserva la que ya tenía, aunque no esté en la lista).
+  const unidad = listaFija({
+    opciones: () => cat.unidades, texto: (u) => u, placeholder: 'Escribe o elige',
+    vacio: 'No está en la lista.', aviso: 'Elige una unidad de la lista (o agrégala como unidad nueva).',
+    inicial: ini.unidad || null, alAgregar: () => nuevaUnidad(),
+  });
+  // Producto: solo se puede elegir de la lista de bodega principal (se escribe una parte para filtrar).
+  const prod = editar ? null : listaFija({
+    opciones: () => cat.productos, texto: (p) => p.producto, foto: (p) => p.foto, placeholder: 'Toca para ver los productos o escribe parte del nombre',
+    vacio: 'No está en la lista.', aviso: 'Elige un producto de la lista (o agrégalo como producto nuevo).', alAgregar: () => nuevoProducto(),
+    alElegir: (p) => {
+      if (!unidad.elegido && p.unidad && cat.unidades.includes(p.unidad)) unidad.elegir(p.unidad);
+    },
+  });
+  if (prod) c.producto = prod.input;
+  const nuevoProducto = () => intentar(async () => {
+    const nombre = await pedirTexto('Agregar producto nuevo a la lista', 'Nombre del producto, como debe quedar en la lista (por ejemplo: CHOCOLATE COBERTURA (1KG))',
+      prod.elegido ? '' : c.producto.value.trim().toUpperCase());
+    if (!nombre) return;
+    const r = await api('/bodega/productos', { nombre });
+    Object.assign(cat, await api('/bodega/catalogo'));
+    const p = cat.productos.find((x) => x.producto === r.producto);
+    if (p) prod.elegir(p);
+    avisar('Agregado a la lista: ' + r.producto, 'bien');
+  });
+  const nuevaUnidad = () => intentar(async () => {
+    const nombre = await pedirTexto('Agregar unidad nueva a la lista', 'Nombre de la unidad, como debe quedar en la lista (por ejemplo: GALON)',
+      unidad.elegido ? '' : unidad.input.value.trim().toUpperCase());
+    if (!nombre) return;
+    const r = await api('/bodega/unidades', { nombre });
+    cat.unidades = r.unidades;
+    unidad.elegir(r.unidad);
+    avisar('Unidad agregada a la lista: ' + r.unidad, 'bien');
+  });
+
+  const campo = (etiqueta, nodo, clase) => h('div', { class: 'campo ' + (clase || '') }, h('label', null, etiqueta), nodo);
+  const el = h('div', { class: 'form-recepcion' },
+    campo('Fecha de ingreso', c.fecha),
+    campo('Producto', editar ? c.producto : [prod.el, prod.aviso,
+      h('button', { class: 'boton-enlace', type: 'button', onclick: nuevoProducto }, '+ Agregar producto nuevo')], 'doble'),
+    campo('Proveedor', c.proveedor, 'ancho-movil'),
+    campo('Lote', [c.lote, editar && ini.en_uso ? h('div', { class: 'chico suave' }, 'Ya se usó en panadería: no se puede cambiar.') : null], 'doble'),
+    campo('Cantidad', c.cantidad),
+    campo('Unidad de medida', [unidad.el, unidad.aviso,
+      h('button', { class: 'boton-enlace', type: 'button', onclick: nuevaUnidad }, '+ Agregar unidad nueva')]),
+    campo('Apariencia visual del producto', apariencia.el), campo('Condiciones de transporte', transporte.el),
+    campo('Aprobado por', c.aprobado), campo('Fecha de caducidad', c.caducidad),
+    h('div', { class: 'campo completo' }, cajaDecision),
+    campo('Observaciones', c.observaciones, 'completo'));
+
+  const leer = () => ({
+    fecha: c.fecha.value, producto: editar ? ini.producto : (prod.elegido ? prod.elegido.producto : ''), proveedor: c.proveedor.value.trim(), lote: c.lote.value.trim(),
+    cantidad: c.cantidad.value.trim(), unidad: unidad.elegido || '', caducidad: c.caducidad.value,
+    apariencia: apariencia.valor, transporte: transporte.valor, decision: algoMal() ? decision.valor : '',
+    aprobado_por: c.aprobado.value.trim(), observaciones: c.observaciones.value.trim(),
+  });
+  const limpiar = (mismoProducto) => {
+    c.lote.value = ''; c.cantidad.value = ''; c.caducidad.value = ''; c.observaciones.value = ''; decision.valor = '';
+    if (!mismoProducto) {
+      prod.limpiar(); unidad.limpiar(); c.proveedor.value = ''; apariencia.valor = ''; transporte.valor = '';
+    }
+    revisar();
+    if (mismoProducto) c.lote.focus();
+  };
+  return { el, leer, limpiar };
+}
+
+async function vistaBodega() {
+  const cat = await api('/bodega/catalogo');
+  let mes = cat.hoy.slice(0, 7);
+  const form = formRecepcion(cat, null, false);
+  const registro = h('div', null);
+  const tituloMes = h('p', { class: 'solo-imprimir' });
+
+  const cargar = () => intentar(async () => {
+    const lista = await api('/recepciones?mes=' + mes);
+    const [a, m] = mes.split('-');
+    tituloMes.textContent = 'Mes: ' + ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre',
+      'octubre', 'noviembre', 'diciembre'][Number(m) - 1] + ' ' + a;
+    llenar(registro, lista.length ? h('div', { class: 'tabla-caja' }, h('table', { class: 'registro-bpm' },
+      h('thead', null, h('tr', null, ['Fecha ingreso', 'Producto', 'Proveedor', 'Lote', 'Cantidad', 'Unidad de medida',
+        'Apariencia visual producto*', 'Condiciones de transporte**', 'Aprobado por', 'Observaciones'].map((t) => h('th', null, t)),
+      h('th', { class: 'no-imprimir' }, ''))),
+      h('tbody', null, lista.map(filaRecepcion))))
+      : h('p', { class: 'suave' }, 'No hay recepciones registradas en este mes.'));
+  });
+  const filaRecepcion = (r) => h('tr', { class: r.anulado ? 'anulada no-imprimir' : '' },
+    h('td', null, dia(r.fecha_ingreso)),
+    h('td', null, r.producto),
+    h('td', null, r.proveedor),
+    h('td', { class: 'mono' }, h('b', null, r.lote_texto), r.caducidad ? h('div', { class: 'chico suave' }, 'Cad. ' + dia(r.caducidad)) : null),
+    h('td', null, r.cantidad), h('td', null, r.unidad), h('td', null, r.apariencia), h('td', null, r.transporte),
+    h('td', null, r.aprobado_por),
+    h('td', null, r.anulado ? h('span', { class: 'etq gris' }, 'ANULADA: ' + r.motivo_anulacion) : null,
+      r.rechazado ? h('span', { class: 'etq rojo' }, 'RECHAZADO') : null, ' ', r.observaciones,
+      r.nota ? h('div', { class: 'chico suave no-imprimir' }, r.nota) : null),
+    h('td', { class: 'no-imprimir' }, r.anulado ? null : h('div', { style: 'display:flex;gap:.3rem;flex-wrap:wrap' },
+      h('button', { class: 'boton chico', type: 'button', onclick: () => corregir(r) }, 'Corregir'),
+      h('button', { class: 'boton chico peligro', type: 'button', onclick: () => anular(r) }, 'Anular'))));
+
+  const corregir = (r) => intentar(async () => {
+    const f = formRecepcion(cat, r, true);
+    const motivo = h('input', { type: 'text', placeholder: 'ej. la cantidad estaba mal escrita' });
+    const datos = await modal('Corregir recepción', h('div', null, f.el, h('label', null, 'Motivo de la corrección (queda registrado)'), motivo),
+      [{ texto: 'Guardar corrección', clase: 'principal', valor: () => Object.assign(f.leer(), { motivo: motivo.value.trim() }) },
+        { texto: 'Cancelar', valor: null }]);
+    if (!datos) return;
+    await api('/recepciones/' + r.id + '/editar', datos);
+    avisar('Corrección guardada', 'bien');
+    cargar();
+  });
+  const anular = (r) => intentar(async () => {
+    const motivo = await pedirTexto('Anular: ' + r.producto + ' · ' + r.lote_texto, 'Motivo (queda registrado)');
+    if (!motivo) return;
+    await api('/recepciones/' + r.id + '/anular', { motivo });
+    avisar('Recepción anulada', 'bien');
+    cargar();
+  });
+  const guardar = (mismoProducto) => intentar(async () => {
+    const d = form.leer();
+    if (variosLotes(d.lote)) {
+      const seguir = await modal('¿Es un solo lote?', h('div', null,
+        h('p', null, 'El código ', h('b', { class: 'mono' }, d.lote), ' parece tener más de un lote.'),
+        h('p', { class: 'suave' }, 'Cada lote va en su propia fila. Si son varios, registra el primero con «Guardar y registrar otro lote del mismo producto».')),
+      [{ texto: 'Corregir', clase: 'principal', valor: false }, { texto: 'Es un solo código, guardarlo así', valor: true }]);
+      if (!seguir) return;
+    }
+    const r = await api('/recepciones', d);
+    avisar('Guardado: ' + r.producto + ' · lote ' + r.lote_texto, 'bien');
+    if (r.aviso) avisar(r.aviso);
+    Object.assign(cat, await api('/bodega/catalogo'));
+    form.limpiar(mismoProducto);
+    cargar();
+  });
+
+  const F = cat.formato;
+  pintar(encabezado('Bodega principal'),
+    h('div', { class: 'tarjeta no-imprimir' }, h('h2', { style: 'margin-top:0' }, 'Nueva recepción'), form.el,
+      h('div', { class: 'fila-botones' },
+        h('button', { class: 'boton principal', type: 'button', onclick: () => guardar(false) }, 'Guardar recepción'),
+        h('button', { class: 'boton', type: 'button', onclick: () => guardar(true) }, 'Guardar y registrar otro lote del mismo producto'))),
+    h('div', { class: 'solo-imprimir' }, h('table', { class: 'cab-bpm' }, h('tbody', null,
+      h('tr', null, h('td', { rowspan: '3', class: 'logo' }, h('img', { src: '/static/logo.png', alt: F.empresa + ' ' + F.subempresa })),
+        h('td', null, F.procedimiento), h('td', null, 'CÓDIGO:'), h('td', null, F.codigo)),
+      h('tr', null, h('td', { rowspan: '2' }, F.registro), h('td', null, 'VERSIÓN:'), h('td', null, F.version)),
+      h('tr', null, h('td', null, 'FECHA ELAB:'), h('td', null, F.fecha_elab))))),
+    h('div', { class: 'en-linea no-imprimir', style: 'margin-top:1.6rem' },
+      h('div', null, h('label', null, 'Registro del mes'), h('input', { type: 'month', value: mes, onchange: (e) => { if (e.target.value) { mes = e.target.value; cargar(); } } })),
+      h('button', { class: 'boton', type: 'button', onclick: () => window.print() }, 'Imprimir'),
+      h('button', { class: 'boton', type: 'button', onclick: () => { location.href = '/api/recepciones.xlsx?mes=' + mes; } }, 'Descargar Excel')),
+    tituloMes, registro);
+  $vista.querySelectorAll('h1, h1 + p').forEach((e) => e.classList.add('no-imprimir'));
+  $vista.classList.add('ancho');
+  paginaHorizontal(true);
+  await cargar();
+}
+
+// ------------------------------------------------------------------ paso a otras áreas (bodega principal)
+// Bodega principal registra lo que pasa a pastelería y carnicería (lo de panadería lo registra bodega secundaria).
+// Pestañas: pasar a otra área (producto → lote → área y cantidad), semáforo de caducidad e historial.
+async function vistaSalidas(pestana) {
+  pestana = ['pasar', 'semaforo', 'historial'].includes(pestana) ? pestana : 'pasar';
+  const cat = await api('/bodega/catalogo');
+  let filtroLotes = '';
+  let datosLotes = { lotes: [], salidas: [], areas: [], dias_por_caducar: 30 };
+  const salidaArea = (l) => intentar(async () => {
+    const u = l.unidad || 'unidades';
+    const areaSal = segmento(datosLotes.areas.map((a) => [a, a]), datosLotes.areas.length === 1 ? datosLotes.areas[0] : '');
+    const cantidad = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', placeholder: 'Solo números',
+      oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; } });
+    const d = await modal('Pasar a otra área', h('div', null,
+      h('p', { style: 'margin-top:0' }, h('b', null, l.producto_bodega || l.ingrediente), ' · lote ', h('b', { class: 'mono' }, l.lote)),
+      h('label', null, '¿A qué área salió?'), areaSal.el,
+      h('label', null, '¿Cuántas ' + u + ' salieron?'), cantidad,
+      l.disponible != null ? h('div', { class: 'chico suave' }, 'En bodega principal quedan ' + num(l.disponible) + ' ' + u + '.') : null,
+      h('div', { class: 'chico suave' }, 'Lo que va a panadería no se anota aquí: lo registra panadería al recibirlo.')),
+    [{ texto: 'Registrar paso', clase: 'principal', valor: () => ({ lote_id: l.id, area: areaSal.valor, cantidad: cantidad.value.trim() }) },
+      { texto: 'Cancelar', valor: null }]);
+    if (!d) return;
+    const r = await api('/bodega/salidas', d);
+    avisar('Registrado: ' + d.cantidad + ' ' + u + ' a ' + d.area + (r.vacio ? '. Ya no queda nada de este lote.' : ''), 'bien');
+    recargar();
+  });
+  const terminarLote = (l) => intentar(async () => {
+    const u = l.unidad || 'unidades';
+    const motivo = await pedirTexto('Se terminó el lote ' + l.lote,
+      (l.disponible > 0 ? 'Según los registros todavía quedaban ' + num(l.disponible) + ' ' + u + '. ' : '')
+      + '¿Qué pasó? (merma, se rompió un empaque, una salida que no se anotó…)');
+    if (motivo === null) return;
+    await api('/bodega/lotes/' + l.id + '/terminar', { motivo });
+    avisar('Lote ' + l.lote + ' cerrado en bodega principal', 'bien');
+    recargar();
+  });
+  const anularSalida = (o) => intentar(async () => {
+    const motivo = await pedirTexto('Anular ' + (o.area === 'AJUSTE' ? 'el cierre' : 'la salida') + ' del lote ' + o.lote, 'Motivo (queda registrado)');
+    if (motivo === null) return;
+    await api('/bodega/salidas/' + o.id + '/anular', { motivo });
+    avisar('Anulado. El lote vuelve a tener ese saldo en bodega principal.', 'bien');
+    recargar();
+  });
+  const fotoDe = (nombre) => (cat.productos.find((p) => p.producto === nombre) || {}).foto || null;
+  const tarjetaSaldo = (l) => tarjetaSemaforo(l, l.producto_bodega || l.ingrediente, l.disponible, [
+    h('button', { class: 'boton chico', type: 'button', onclick: () => salidaArea(l) }, 'Pasar a otra área'),
+    h('button', { class: 'boton chico', type: 'button', onclick: () => terminarLote(l) }, 'Se terminó'),
+    h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => { if (await darDeBaja(l, 'principal', l.disponible)) recargar(); }) }, 'Dar de baja')],
+    fotoDe(l.producto_bodega));
+  const pintarLotes = () => {
+    const { lotes } = datosLotes;
+    const n = normal(filtroLotes);
+    const visibles = lotes.filter((l) => !n || normal([l.producto_bodega, l.ingrediente, l.lote, l.proveedor].join(' ')).includes(n));
+    const buscar = buscadorLotes(cajaLotes, filtroLotes, (v) => { filtroLotes = v; pintarLotes(); });
+    llenar(cajaLotes,
+      lotes.length ? leyendaSemaforo(lotes) : null,
+      lotes.length > 6 ? buscar : null,
+      lotes.length ? (visibles.length ? visibles.map(tarjetaSaldo) : h('p', { class: 'suave' }, 'Ningún lote coincide con la búsqueda.'))
+        : h('p', { class: 'suave' }, 'No hay lotes con saldo en bodega principal.'));
+  };
+
+
+  const cajaLotes = h('div', null);
+  let productoSel = null;
+  let loteSel = null;
+  let areaSel = '';
+  let cantidadSel = '';
+  const contenido = h('div', null);
+  const recargar = () => intentar(async () => { datosLotes = await api('/bodega/lotes'); dibujar(); });
+
+  // Productos: los de la lista de bodega (menos los que no son de panadería) y cualquier otro que tenga lotes con saldo.
+  const lotesDe = (nombre) => datosLotes.lotes.filter((l) => (l.producto_bodega || l.ingrediente) === nombre);
+  const productos = () => {
+    const nombres = cat.productos.filter((p) => !p.ignorar).map((p) => p.producto);
+    datosLotes.lotes.forEach((l) => { const n = l.producto_bodega || l.ingrediente; if (!nombres.includes(n)) nombres.push(n); });
+    return nombres;
+  };
+  const registrarPaso = (l) => intentar(async () => {
+    if (l.semaforo === 'rojo' && !await confirmar('Lote caducado', 'El lote ' + l.lote + ' está caducado. ¿Seguro que quieres pasarlo a ' + (areaSel || 'otra área') + '?', 'Sí, pasarlo igual')) return;
+    const u = l.unidad || 'unidades';
+    const r = await api('/bodega/salidas', { lote_id: l.id, area: areaSel, cantidad: cantidadSel });
+    avisar('Registrado: ' + cantidadSel + ' ' + u + ' del lote ' + l.lote + ' a ' + areaSel + (r.vacio ? '. Ya no queda nada de este lote.' : ''), 'bien');
+    productoSel = null; loteSel = null; areaSel = ''; cantidadSel = '';
+    await recargar();
+  });
+  const pintarPasar = () => {
+    if (!productoSel) {
+      return [h('h2', { style: 'margin-top:.4rem' }, '¿Qué producto sale?'),
+        h('div', { class: 'rejilla' }, productos().map((n) => {
+          const hay = lotesDe(n).length;
+          return h('button', { class: 'mosaico con-foto' + (hay ? '' : ' vacio'), type: 'button', disabled: !hay,
+            onclick: () => { productoSel = n; loteSel = null; dibujar(); } }, fotoProducto(fotoDe(n), n), h('b', null, n));
+        }))];
+    }
+    const lotes = lotesDe(productoSel);
+    const bloquePaso = (l) => {
+      const u = l.unidad || 'unidades';
+      const areaSeg = segmento(datosLotes.areas.map((a) => [a, a]), areaSel, (v) => { areaSel = v; });
+      const cantidad = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', placeholder: 'Solo números', value: cantidadSel,
+        oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; cantidadSel = v; } });
+      return h('div', { class: 'tarjeta', style: 'margin-top:-.3rem;border:2px solid var(--ok)' },
+        h('label', { style: 'margin-top:0' }, '¿A qué área?'), areaSeg.el,
+        h('label', null, '¿Cuántas ' + u + '?' + (l.disponible != null ? ' (quedan ' + num(l.disponible) + ')' : '')), cantidad,
+        h('div', { class: 'fila-botones' }, h('button', { class: 'boton ok', type: 'button', onclick: () => registrarPaso(l) }, 'Registrar')));
+    };
+    return [h('a', { class: 'volver', href: '#/salidas', onclick: (e) => { e.preventDefault(); productoSel = null; loteSel = null; dibujar(); } }, '← Elegir otro producto'),
+      h('h2', { class: 'titulo-con-foto', style: 'margin-top:.2rem' }, fotoProducto(fotoDe(productoSel), productoSel), productoSel),
+      h('p', { class: 'suave' }, '¿Qué lote?'),
+      lotes.map((l) => [
+        tarjetaLote(l, { elegible: true, breve: true, saldo: true, marcado: loteSel === l.id, alTocar: () => { loteSel = loteSel === l.id ? null : l.id; dibujar(); } }),
+        loteSel === l.id ? bloquePaso(l) : null])];
+  };
+  const pintarHistorial = () => {
+    const { salidas } = datosLotes;
+    return [h('div', { class: 'fila-botones', style: 'margin-top:0' }, h('button', { class: 'boton', type: 'button',
+        onclick: () => { location.href = '/api/bodega/salidas.xlsx'; } }, 'Descargar Excel')),
+      salidas.length ? h('div', { class: 'salidas-areas' },
+        h('div', { class: 'tabla-caja' }, h('table', null,
+          h('thead', null, h('tr', null, ['Fecha', 'Producto', 'Lote', 'Cantidad', 'Destino', 'Registró', ''].map((t) => h('th', null, t)))),
+          h('tbody', null, salidas.map((o) => h('tr', { class: o.anulado ? 'anulada' : '' },
+            h('td', null, hora(o.fecha_hora)), h('td', null, o.producto_bodega || o.ingrediente), h('td', { class: 'mono' }, o.lote),
+            h('td', null, num(o.cantidad) + (o.unidad ? ' ' + o.unidad : '')),
+            h('td', null, o.area === 'AJUSTE' ? 'Cierre: ' + o.motivo : o.area === 'BAJA' ? 'Baja: ' + o.motivo.toLowerCase() : o.area,
+              o.anulado ? h('div', null, h('span', { class: 'etq gris' }, 'ANULADA: ' + o.motivo_anulacion)) : null),
+            h('td', null, o.persona),
+            h('td', null, o.anulado ? null : h('button', { class: 'boton chico peligro', type: 'button', onclick: () => anularSalida(o) }, 'Anular'))))))))  : h('p', { class: 'suave' }, 'Todavía no hay pasos a otras áreas ni cierres de lote.')];
+  };
+  const dibujar = () => {
+    const rojos = datosLotes.lotes.filter((l) => l.semaforo === 'rojo').length;
+    const pest = [['pasar', 'Pasar a otra área'], ['semaforo', ['Semáforo', rojos ? h('span', { class: 'num rojo', title: rojos + ' caducado(s)' }, rojos) : null]], ['historial', 'Historial']];
+    if (pestana === 'semaforo') pintarLotes();
+    llenar(contenido,
+      h('div', { class: 'pestanas' }, pest.map(([id, nombre]) => h('button', { type: 'button', class: (id === pestana ? 'activa' : '') + (id === 'semaforo' && rojos ? ' con-rojo' : ''),
+        onclick: () => { pestana = id; history.replaceState(null, '', '#/salidas/' + id); dibujar(); } }, nombre))),
+      pestana === 'pasar' ? pintarPasar() : pestana === 'semaforo' ? cajaLotes : pintarHistorial());
+  };
+  datosLotes = await api('/bodega/lotes');
+  pintar(encabezado('Paso a otras áreas'), contenido);
+  dibujar();
+}
+
+// ------------------------------------------------------------------ bodega secundaria
+// Pestañas: registrar ingreso (lo que llega de bodega principal) y semáforo de lo que hay en bodega secundaria.
+async function vistaSecundaria(pestana) {
+  pestana = pestana === 'semaforo' ? 'semaforo' : 'ingreso';
+  const [ings, lotesSec] = await Promise.all([api('/ingredientes'), api('/lotes?donde=secundaria')]);
+  const deProveedor = ings.filter((i) => i.tipo === 'lote');
+  const enBodega = ordenarSemaforo(lotesSec);
+  // Semáforo de lo que hay en bodega secundaria: arriba lo caducado y lo que caduca antes.
+  const cajaSec = h('div', null);
+  let filtro = '';
+  const cambiar = (l) => intentar(async () => {
+    const r = await modal(l.ingrediente + ' · ' + l.lote, h('p', null, '¿Qué pasó con este lote?'),
+      [{ texto: 'Ya no queda nada de este lote (agotado)', clase: 'principal', valor: 'agotar' },
+        { texto: 'Lo registré por error: no llegó', valor: 'devolver' }, { texto: 'Cancelar', valor: null }]);
+    if (r === 'agotar') await api('/lotes/agotar', { lote_id: l.id });
+    if (r === 'devolver') await api('/secundaria/devolver', { lote_id: l.id });
+    if (r) vistaSecundaria('semaforo');
+  });
+  const pintarSec = () => {
+    const n = normal(filtro);
+    const visibles = enBodega.filter((l) => !n || normal([l.ingrediente, l.producto_bodega, l.lote, l.proveedor].join(' ')).includes(n));
+    llenar(cajaSec,
+      enBodega.length ? leyendaSemaforo(enBodega) : null,
+      enBodega.length > 6 ? buscadorLotes(cajaSec, filtro, (v) => { filtro = v; pintarSec(); }) : null,
+      enBodega.length ? (visibles.length ? visibles.map((l) => tarjetaSemaforo(l, l.ingrediente, l.disponible_cocina, [
+        h('button', { class: 'boton chico', type: 'button', onclick: () => cambiar(l) }, 'Cambiar'),
+        h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+          if (await darDeBaja(l, 'secundaria', l.disponible_cocina)) vistaSecundaria('semaforo'); }) }, 'Dar de baja')],
+        (ings.find((i) => i.id === l.ingrediente_id) || {}).foto || null))
+        : h('p', { class: 'suave' }, 'Ningún lote coincide con la búsqueda.'))
+        : h('p', { class: 'suave' }, 'Todavía no hay lotes registrados.'));
+  };
+  const rojos = enBodega.filter((l) => l.semaforo === 'rojo').length;
+  const pest = [['ingreso', 'Registrar ingreso'], ['semaforo', ['Semáforo', rojos ? h('span', { class: 'num rojo', title: rojos + ' caducado(s)' }, rojos) : null]]];
+  pintar(encabezado('Bodega secundaria', 'Registra aquí cada lote que llega desde bodega principal.'),
+    h('div', { class: 'pestanas' }, pest.map(([id, nombre]) => h('button', { type: 'button', class: (id === pestana ? 'activa' : '') + (id === 'semaforo' && rojos ? ' con-rojo' : ''),
+      onclick: () => { history.replaceState(null, '', '#/secundaria/' + id); vistaSecundaria(id); } }, nombre))),
+    pestana === 'ingreso' ? [
+      h('h2', { style: 'margin-top:.4rem' }, '¿Qué ingrediente llegó?'),
+      // Solo se puede elegir un ingrediente que tenga lotes en bodega principal (el número no se muestra).
+      h('div', { class: 'rejilla' }, deProveedor.map((i) => h('button', { class: 'mosaico con-foto' + (i.n_principal ? '' : ' vacio'), type: 'button',
+        disabled: !i.n_principal, onclick: () => intentar(() => elegirIngreso(i)) }, fotoProducto(i.foto, i.nombre), h('b', null, i.nombre)))),
+      h('p', { class: 'chico suave' }, 'Aquí se registra todo lo que llega a la panadería, secos y refrigerados (mantequilla, huevos, leche…).')]
+      : cajaSec);
+  if (pestana === 'semaforo') pintarSec();
+}
+
+async function elegirIngreso(ing) {
+  const lotes = await api('/lotes?donde=principal&ingrediente_id=' + ing.id);
+  const elegidos = new Map();          // lote_id -> { cantidad, vacio }
+  let verTodos = false;
+  let enfocar = null;
+  const bloqueCantidad = (l) => {
+    const e = elegidos.get(l.id);
+    const u = l.unidad || 'unidades';
+    const campo = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: e.cantidad, placeholder: 'ej. 2',
+      oninput: (ev) => { e.cantidad = ev.target.value; } });
+    if (enfocar === l.id) setTimeout(() => campo.focus(), 50);
+    return h('div', { class: 'tarjeta', style: 'margin-top:-.3rem;border:2px solid var(--ok)' },
+      h('label', { style: 'margin-top:0' }, '¿Cuántas ' + u + ' de este lote pasan a bodega secundaria?'), campo,
+      l.disponible != null
+        ? h('div', { class: 'chico suave' }, 'En bodega principal hay ' + num(l.disponible) + ' ' + u + '.')
+        : h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' },
+          h('input', { type: 'checkbox', checked: e.vacio, onchange: (ev) => { e.vacio = ev.target.checked; } }),
+          'Ya no queda más de este lote en bodega principal'));
+  };
+  const dibujar = () => {
+    const y = window.scrollY;
+    const visibles = verTodos ? lotes : lotes.slice(0, 8);
+    pintar(h('a', { class: 'volver', href: '#/secundaria', onclick: (e) => { e.preventDefault(); vistaSecundaria(); } }, '← Bodega secundaria'),
+      h('h1', null, ing.nombre),
+      h('p', { class: 'suave' }, 'Toca el lote que llegó (compara con el empaque) y escribe cuánto de ese lote pasó a bodega secundaria.'),
+      visibles.length ? visibles.map((l) => [
+        tarjetaLote(l, { elegible: true, breve: true, marcado: elegidos.has(l.id), conNota: true, alTocar: () => {
+          if (elegidos.has(l.id)) elegidos.delete(l.id);
+          else { elegidos.set(l.id, { cantidad: '', vacio: false }); enfocar = l.id; }
+          dibujar();
+        } }),
+        elegidos.has(l.id) ? bloqueCantidad(l) : null])
+        : h('div', { class: 'nota' }, 'No hay lotes de este ingrediente en bodega principal.'),
+      !verTodos && lotes.length > 8 ? h('button', { class: 'boton chico', type: 'button', onclick: () => { verTodos = true; dibujar(); } },
+        'Ver ' + (lotes.length - 8) + ' lotes más antiguos') : null,
+      h('div', { class: 'fila-botones' }, h('button', { class: 'boton chico peligro', type: 'button',
+        onclick: async () => { if (await loteManual(ing, 'secundaria')) vistaSecundaria(); } }, 'No encuentro el lote en la lista')),
+      h('div', { class: 'pie-fijo' }, h('div', null, h('button', { class: 'boton ok ancho', type: 'button', disabled: !elegidos.size,
+        onclick: () => intentar(async () => {
+          const items = [...elegidos].map(([lote_id, e]) => ({ lote_id, cantidad: e.cantidad, vacio: e.vacio }));
+          const caducados = lotes.filter((l) => elegidos.has(l.id) && l.semaforo === 'rojo');
+          if (caducados.length && !await confirmar('Lote caducado',
+            (caducados.length === 1 ? 'El lote ' + caducados[0].lote + ' está caducado' : 'Los lotes ' + listaLotes(caducados) + ' están caducados')
+            + '. ¿Seguro que quieres registrarlo en bodega secundaria?', 'Sí, registrarlo igual')) return;
+          await api('/secundaria/ingreso', { items });
+          avisar(items.length + ' lote(s) registrados en bodega secundaria', 'bien'); vistaSecundaria();
+        }) }, elegidos.size ? 'Registrar ' + elegidos.size + ' lote(s) en bodega secundaria' : 'Elige al menos un lote'))));
+    window.scrollTo(0, y);
+    enfocar = null;
+  };
+  dibujar();
+}
+
+// ------------------------------------------------------------------ cocina
+async function vistaCocina() {
+  const [ings, rec] = await Promise.all([api('/ingredientes'), api('/cocina/recipientes')]);
+  const usables = ings.filter((i) => i.tipo !== 'no_aplica');
+  // Subreceta (relleno, glacé, masa madre): sigue en uso (guardada en el refrigerador) hasta que se acaba o se hace una nueva.
+  const cerrarSub = (g, l) => intentar(async () => {
+    if (!await confirmar('Se terminó ' + g.ingrediente, 'El lote ' + l.lote + ' se cierra y ya no se anotará en los panes.', 'Sí, se terminó')) return;
+    await api('/cocina/vaciar', { ingrediente_id: g.ingrediente_id, recipiente: g.recipiente, lote_ids: [l.id], terminado: true });
+    avisar('Lote cerrado', 'bien'); vistaCocina();
+  });
+  const tarjetaRecipiente = (g) => h('div', { class: 'tarjeta' },
+    h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem;align-items:center;flex-wrap:wrap' },
+      h('div', null, h('b', null, g.ingrediente), ' ', g.tipo === 'interno' ? null : h('span', { class: 'etq gris' },
+        g.n_recipientes === 0 ? 'en su empaque' : g.n_recipientes > 1 ? 'Recipiente ' + g.recipiente : 'Recipiente'),
+      g.n_recipientes !== 0 && g.lotes.length > 1 ? [' ', h('span', { class: 'etq ' + (g.exceso ? 'rojo' : 'aviso') }, g.lotes.length + ' lotes mezclados')] : null)),
+    g.exceso ? h('div', { class: 'nota rojo' }, 'Más de ' + rec.maximo + ' lotes mezclados: conviene vaciar y limpiar este recipiente antes de poner el siguiente lote.') : null,
+    g.lotes.map((l) => h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem;align-items:center;margin-top:.45rem' },
+      h('div', null, h('span', { class: 'chip-lote' }, l.lote), l.origen === 'manual' ? h('span', { class: 'etq rojo' }, 'a mano') : null,
+        h('span', { class: 'chico suave' }, ' desde ' + hora(l.abierto_en)), ' ', semaforo(l)),
+      h('div', { class: 'fila-botones', style: 'margin:0' },
+        g.tipo === 'interno' && l.semaforo !== 'rojo' ? h('button', { class: 'boton chico', type: 'button', onclick: () => cerrarSub(g, l) }, 'Se terminó')
+ : null,
+        h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+          if (await darDeBaja(Object.assign({ ingrediente: g.ingrediente }, l), 'cocina', null)) vistaCocina(); }) }, 'Dar de baja')))));
+  // Ingredientes de bodega (llegan de bodega secundaria). Las subrecetas no se abren aquí: su lote queda en uso
+  // desde que se empieza su producción hasta que se termina, se da de baja o se reemplaza por una nueva tanda.
+  const deBodega = usables.filter((i) => i.tipo !== 'interno');
+  const enUso = (i) => i.n_abiertos ? h('span', { class: 'num verde' }, i.n_abiertos + ' en uso') : null;
+  pintar(encabezado('Cocina', 'Antes de abrir un empaque nuevo, regístralo aquí. Lo que está abierto es lo que se anota en las hojas.'),
+    h('h2', null, 'Abrir un lote: ¿de qué ingrediente?'),
+    h('div', { class: 'rejilla' }, deBodega.map((i) => h('button', { class: 'mosaico con-foto foto-chica' + (i.n_secundaria ? '' : ' vacio'), type: 'button',
+      onclick: () => intentar(() => elegirApertura(i)) },
+    enUso(i), fotoProducto(i.foto, i.nombre), h('b', null, i.nombre), h('small', null, i.n_secundaria ? i.n_secundaria + ' lote(s) en bodega secundaria' : 'Nada en bodega secundaria')))),
+    h('h2', null, 'En uso ahora en cocina ', h('span', { class: 'num verde' }, rec.grupos.reduce((n, g) => n + g.lotes.length, 0))),
+    h('p', { class: 'chico suave' }, 'Estos lotes se anotan en cada pan que se empiece. Cuando pongas un lote nuevo, la app pregunta si el anterior se acabó.'),
+    rec.grupos.some((g) => g.lotes.some((l) => l.semaforo === 'rojo'))
+      ? h('div', { class: 'nota rojo' }, 'Hay un lote caducado en uso: dalo de baja. Mientras siga abierto, no se pueden empezar los panes que lo llevan.') : null,
+    rec.grupos.length ? rec.grupos.map(tarjetaRecipiente) : h('p', { class: 'suave' }, 'No hay ningún lote en uso.'));
+}
+
+async function elegirApertura(ing) {
+  const conCantidad = ing.tipo === 'lote';            // las subrecetas no llevan cantidad
+  // Cocina solo puede tomar lo que hay en bodega secundaria: un lote ya tomado completo está en "En uso ahora en cocina".
+  const lotes = conCantidad
+    ? (await api('/lotes?donde=secundaria&ingrediente_id=' + ing.id)).filter((l) => l.disponible_cocina == null || l.disponible_cocina > 0)
+    : await api('/lotes?donde=abribles&ingrediente_id=' + ing.id);
+  const lugar = 'bodega secundaria';
+  const elegidos = new Map();                         // lote_id -> { cantidad }
+  let enfocar = null;
+  const sinSaldo = (l) => conCantidad && l.disponible_cocina != null && l.disponible_cocina <= 0;
+  const nRec = ing.recipientes || 0;
+  const bloqueCantidad = (l) => {
+    const e = elegidos.get(l.id);
+    const u = l.unidad || 'unidades';
+    const campo = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: e.cantidad, placeholder: 'ej. 1',
+      oninput: (ev) => { e.cantidad = ev.target.value; } });
+    if (enfocar === l.id) setTimeout(() => campo.focus(), 50);
+    const rec = nRec > 1 ? segmento(Array.from({ length: nRec }, (_, i) => [String(i + 1), 'Recipiente ' + (i + 1)]),
+      e.recipiente ? String(e.recipiente) : '', (v) => { e.recipiente = Number(v); }) : null;
+    return h('div', { class: 'tarjeta', style: 'margin-top:-.3rem;border:2px solid var(--ok)' },
+      rec ? [h('label', { style: 'margin-top:0' }, '¿En qué recipiente lo pones?'), rec.el] : null,
+      h('label', { style: rec ? '' : 'margin-top:0' }, '¿Cuántas ' + u + ' de este lote toma cocina?'), campo,
+      h('div', { class: 'chico suave' }, l.disponible_cocina != null
+        ? 'En ' + lugar + ' hay ' + num(l.disponible_cocina) + ' ' + u + '.'
+        : 'No se sabe cuánto hay en ' + lugar + ' de este lote (se pasó antes de registrar cantidades).'));
+  };
+  const dibujar = () => {
+    const y = window.scrollY;
+    pintar(h('a', { class: 'volver', href: '#/cocina', onclick: (e) => { e.preventDefault(); vistaCocina(); } }, '← Cocina'),
+      h('h1', null, ing.nombre),
+      h('p', { class: 'suave' }, ing.tipo === 'interno' ? 'Lotes guardados de esta subreceta. Toca el que vas a usar.'
+          : 'Toca el lote que tomas de bodega secundaria y escribe cuánto.'),
+      lotes.length ? lotes.map((l) => {
+        if (sinSaldo(l) || (!conCantidad && l.abierto_en)) return tarjetaLote(l);
+        if (l.semaforo === 'rojo') return [tarjetaLote(l, { cocina: conCantidad }), h('div', { class: 'nota rojo', style: 'margin-top:-.3rem' },
+          'Caducado: no se puede usar. ' + (ing.tipo === 'interno' ? 'Dalo por terminado.' : 'Dalo de baja en Bodega secundaria.'))];
+        const terminar = ing.tipo === 'interno' ? h('button', { class: 'boton chico', type: 'button', onclick: (e) => { e.stopPropagation(); intentar(async () => {
+          if (!await confirmar('Se terminó ' + ing.nombre, 'El lote ' + l.lote + ' se cierra y ya no aparecerá para abrir.', 'Sí, se terminó')) return;
+          await api('/lotes/agotar', { lote_id: l.id }); avisar('Lote cerrado', 'bien'); elegirApertura(ing);
+        }); } }, 'Se terminó') : null;
+        return [tarjetaLote(l, { elegible: true, cocina: conCantidad, marcado: elegidos.has(l.id), conNota: !conCantidad, acciones: terminar, alTocar: () => {
+          if (elegidos.has(l.id)) elegidos.delete(l.id);
+          else { elegidos.set(l.id, { cantidad: '' }); enfocar = l.id; }
+          dibujar();
+        } }), conCantidad && elegidos.has(l.id) ? bloqueCantidad(l) : null];
+      })
+        : h('div', { class: 'nota' }, ing.tipo === 'interno' ? 'No hay lotes de esta subreceta. Inicia su producción en «Producción».'
+          : 'No hay lotes de este ingrediente en bodega secundaria.'),
+      ing.tipo === 'lote' ? h('div', { class: 'fila-botones' }, h('button', { class: 'boton chico peligro', type: 'button',
+        onclick: async () => { if (await loteManual(ing, 'cocina')) vistaCocina(); } }, 'No encuentro el lote en la lista')) : null,
+      h('div', { class: 'pie-fijo' }, h('div', null, h('button', { class: 'boton ok ancho', type: 'button', disabled: !elegidos.size,
+        onclick: () => intentar(async () => {
+          if (nRec > 1 && ing.tipo !== 'interno' && [...elegidos.values()].some((e) => !e.recipiente)) throw new Error('Elige en qué recipiente pones cada lote.');
+          const items = [...elegidos].map(([lote_id, e]) => ({ lote_id, cantidad: e.cantidad, recipiente: e.recipiente || 1 }));
+          const r = await api('/cocina/abrir', { items });
+          avisar('Registrado en cocina', 'bien');
+          await preguntarAnteriores(r.anteriores); vistaCocina();
+        }) }, elegidos.size ? 'Registrar ' + elegidos.size + ' lote(s) en cocina' : 'Elige el lote que vas a usar'))));
+    window.scrollTo(0, y);
+    enfocar = null;
+  };
+  dibujar();
+}
+
+// ------------------------------------------------------------------ produccion
+function tarjetaProduccion(p) {
+  return h('a', { class: 'tarjeta', href: '#/hoja/' + p.id, style: 'display:block;text-decoration:none;color:inherit' },
+    h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem;align-items:start' },
+      h('div', null, h('div', { class: 'nombre-hoja' }, p.producto), h('div', { class: 'mono lote-hoja' }, p.lote_final),
+        h('div', { class: 'chico suave' }, 'Inició ' + hora(p.iniciado_en) + ' · ' + (p.iniciado_por || ''))),
+      h('div', { style: 'text-align:right' }, h('span', { class: 'etq ' + CLASE_ESTADO[p.estado] }, NOMBRE_ESTADO[p.estado]),
+        p.faltantes ? h('div', null, h('span', { class: 'etq rojo' }, 'Faltan ' + p.faltantes + ' lote(s)')) : null)));
+}
+
+// Cocina: los chefs solo avisan que empieza y que termina la produccion de un pan.
+async function vistaProduccion() {
+  const [productos, enCurso] = await Promise.all([api('/productos'), api('/producciones?estado=en_curso')]);
+  // Vista previa: ingredientes de la hoja con los lotes que ya quedaron anotados.
+  const hojas = await Promise.all(enCurso.map((p) => api('/producciones/' + p.id)));
+  const ingredientesDe = (hoja) => h('div', { class: 'vista-ingredientes' }, hoja.lineas.map((li) => {
+    const vigentes = li.lotes.filter((l) => !l.quitado_en);
+    return h('div', { class: 'fila-ing' + (li.falta_lote ? ' falta' : '') },
+      h('span', { class: 'nombre-ing' }, li.etiqueta),
+      li.tipo === 'no_aplica' ? h('span', { class: 'suave' }, '—')
+        : li.no_utilizado ? h('span', { class: 'suave' }, 'No se usó')
+        : vigentes.length ? h('span', null, vigentes.map((l) => h('span', { class: 'chip-lote' }, l.lote)))
+        : h('span', { class: 'sin-lote' }, 'Sin lote'));
+  }));
+  const tarjetaEnCurso = (p, i) => h('div', { class: 'tarjeta' },
+    h('div', { style: 'display:flex;justify-content:space-between;gap:.8rem;align-items:center;flex-wrap:wrap' },
+      h('div', null, h('div', { class: 'nombre-en-curso' }, p.producto), h('div', { class: 'mono' }, p.lote_final),
+        h('div', { class: 'chico suave' }, 'Empezó ' + hora(p.iniciado_en) + ' · ' + (p.iniciado_por || ''))),
+      h('button', { class: 'boton ok', type: 'button', onclick: () => intentar(async () => {
+        if (!await confirmar('Terminó ' + p.producto, 'Producción ' + p.lote_final + '. El encargado completará la hoja.', 'Sí, terminó')) return;
+        await api('/producciones/' + p.id + '/terminar', {});
+        avisar('Listo: ' + p.producto + ' terminó', 'bien'); vistaProduccion();
+      }) }, 'Terminó')),
+    hojas[i] && hojas[i].lineas.length ? ingredientesDe(hojas[i]) : null,
+    h('button', { class: 'boton chico', type: 'button', style: 'margin-top:.6rem;border:0;padding-left:0;color:var(--tinta-suave)',
+      onclick: () => intentar(async () => {
+        const motivo = await pedirTexto('Anular ' + p.producto + ' ' + p.lote_final, '¿Qué pasó? (por ejemplo: me equivoqué de pan)');
+        if (!motivo) return;
+        await api('/producciones/' + p.id + '/anular', { motivo }); avisar('Anulada'); vistaProduccion();
+      }) }, 'Me equivoqué de pan'));
+  pintar(encabezado('Producción'),
+    h('h2', null, 'En producción ahora ', h('span', { class: 'num verde' }, enCurso.length)),
+    enCurso.length ? enCurso.map(tarjetaEnCurso) : h('p', { class: 'suave' }, 'No hay ningún pan en producción.'),
+    h('h2', null, 'Empezar producción de…'),
+    // Un pan que ya está en producción no se puede empezar otra vez hasta que termine.
+    h('div', { class: 'rejilla' }, productos.filter((p) => p.activo && !p.armado).map((p) => {
+      const enMarcha = enCurso.some((x) => x.producto_id === p.id);
+      return h('button', { class: 'mosaico' + (p.lineas.length && !enMarcha ? '' : ' vacio'), disabled: enMarcha,
+      type: 'button', onclick: (ev) => intentar(async () => {
+        if (ev.currentTarget) ev.currentTarget.disabled = true;
+        // Subreceta: antes de empezar, qué pasa con lo que quedaba de la anterior (abierto o guardado).
+        const previos = p.produce_ingrediente_id ? await api('/lotes?donde=abribles&ingrediente_id=' + p.produce_ingrediente_id) : [];
+        let anteriores;
+        if (previos.length) {
+          anteriores = await preguntarSubrecetaAnterior(p, previos);
+          if (!anteriores) { vistaProduccion(); return; }
+        } else if (!await confirmar('Empezar ' + p.nombre, 'Se anotarán los lotes que están abiertos en cocina en este momento.', 'Empezar')) { vistaProduccion(); return; }
+        const hoja = await api('/producciones', anteriores ? { producto_id: p.id, anteriores } : { producto_id: p.id });
+        avisar('Empezó ' + p.nombre + ' · lote ' + hoja.lote_final, 'bien');
+        await preguntarAnteriores(hoja.anteriores);
+        vistaProduccion();
+      }) }, h('b', null, p.nombre), h('small', null, enMarcha ? 'En producción' : p.produce ? 'Subreceta' : (p.lineas.length ? 'Lote …' + p.codigo : 'Sin receta todavía')));
+    })));
+}
+
+// Antes de empezar una subreceta: ¿lo que quedaba de la anterior se terminó, se guarda aparte o se mezcla con la nueva?
+async function preguntarSubrecetaAnterior(p, previos, respuestas) {
+  respuestas = respuestas || new Map();
+  const filas = previos.map((l) => {
+    // Solo dos casos reales: se hace más porque se acabó lo anterior, o porque no alcanza y se mezcla con lo nuevo.
+    if (l.semaforo === 'rojo') respuestas.set(l.id, 'terminado');      // caducado: no se puede mezclar
+    const seg = segmento(l.semaforo === 'rojo' ? [['terminado', 'Se terminó (caducado)']] : [['terminado', 'Se terminó'], ['mezcla', 'Se mezcla con el nuevo']], respuestas.get(l.id) || '',
+      (v) => { respuestas.set(l.id, v); });
+    return h('div', { class: 'tarjeta', style: 'margin:.5rem 0' },
+      h('div', null, h('b', { class: 'mono' }, l.lote), ' ', semaforo(l), ' ', l.abierto_en ? h('span', { class: 'etq verde' }, 'abierto en cocina') : h('span', { class: 'etq gris' }, 'guardado')),
+      h('div', { style: 'margin-top:.4rem' }, seg.el));
+  });
+  const ok = await modal('Antes de empezar ' + p.nombre, h('div', null,
+    h('p', { style: 'margin-top:0' }, 'Todavía hay ' + (previos.length === 1 ? 'un lote anterior' : previos.length + ' lotes anteriores') + '. ¿Qué pasa con ' + (previos.length === 1 ? 'él' : 'cada uno') + '?'),
+    filas,
+    h('p', { class: 'chico suave' }, 'Si se mezcla, el lote nuevo vence cuando vence el más antiguo.')),
+  [{ texto: 'Empezar', clase: 'principal', valor: true }, { texto: 'Cancelar', valor: null }]);
+  if (!ok) return null;
+  if (previos.some((l) => !respuestas.has(l.id))) {
+    avisar('Responde qué pasa con cada lote anterior antes de empezar.');
+    return preguntarSubrecetaAnterior(p, previos, respuestas);
+  }
+  return previos.map((l) => ({ lote_id: l.id, accion: respuestas.get(l.id) }));
+}
+
+// Produccion: el encargado ve lo que se esta produciendo y completa las hojas terminadas.
+async function vistaHojas() {
+  const [lista, productos] = await Promise.all([api('/producciones'), api('/productos')]);
+  const mezclas = productos.filter((p) => p.armado && p.activo);
+  const grupo = (estado) => lista.filter((p) => p.estado === estado);
+  const textos = {
+    en_curso: 'Se están produciendo ahora. Se pueden completar cuando cocina avise que terminaron.',
+    por_completar: 'Cocina ya terminó: falta llenar cantidades, horneado y unidades, y cerrar la hoja.',
+    completa: 'Últimas 15.',
+  };
+  pintar(encabezado('Hojas de producción'),
+    mezclas.length ? [h('h2', null, 'Armar Mix Bread'),
+      h('div', { class: 'rejilla' }, mezclas.map((p) => h('button', { class: 'mosaico mosaico-mix', type: 'button', onclick: () => intentar(() => vistaArmarMix(p.id)) },
+        h('b', null, p.nombre), h('small', null, p.componentes.map((c) => c.nombre).join(' · ') || 'Sin panes definidos'))))] : null,
+    ['por_completar', 'en_curso', 'completa'].map((estado) => {
+      const g = grupo(estado).slice(0, estado === 'completa' ? 15 : 100);
+      return [h('h2', null, NOMBRE_ESTADO[estado] + ' ', h('span', { class: 'num' + (estado === 'por_completar' && g.length ? ' rojo' : '') }, grupo(estado).length)),
+        h('p', { class: 'chico suave' }, textos[estado]),
+        g.length ? g.map(tarjetaProduccion) : h('p', { class: 'suave' }, 'Ninguna.')];
+    }));
+}
+
+// El encargado arma un Mix Bread con unidades de lotes de pan ya producidos.
+async function vistaArmarMix(productoId) {
+  const r = await api('/mix/' + productoId);
+  const elegidos = new Map();                 // origen_id -> { unidades }
+  let enfocar = null;
+  const paquetes = h('input', { type: 'text', inputmode: 'decimal', placeholder: 'ej. 20' });
+  const etiquetas = h('input', { type: 'number', min: '0', value: '1' });
+  const obs = h('input', { type: 'text' });
+  const venceTxt = h('div', { class: 'nota verde', hidden: true });
+  const todos = r.grupos.flatMap((g) => g.lotes);
+  const contenido = h('div', null);
+  const tarjetaPan = (l) => {
+    const marcado = elegidos.has(l.id);
+    const sinSaldo = l.disponible != null && l.disponible <= 0;
+    const detalle = ['elaborado ' + dia(l.fecha), NOMBRE_ESTADO[l.estado].toLowerCase(),
+      l.unidades ? 'producidos ' + l.unidades : null, l.unidades_lote ? 'para su lote ' + l.unidades_lote : null,
+      l.usado_mix ? 'ya en Mix Bread ' + num(l.usado_mix) : null, 'vence ' + dia(l.fecha_vencimiento)].filter(Boolean).join(' · ');
+    const tarjeta = h('div', { class: 'lote' + (sinSaldo ? '' : ' elegible') + (marcado ? ' marcado' : '') },
+      sinSaldo ? null : h('div', { class: 'caja' }, marcado ? '✓' : ''),
+      h('div', { class: 'datos' }, h('div', { class: 'codigo' }, l.lote_final), h('div', { class: 'chico suave' }, detalle),
+        l.disponible != null ? h('span', { class: 'etq ' + (sinSaldo ? 'gris' : 'verde') }, 'Disponibles: ' + num(Math.max(l.disponible, 0)))
+          : h('span', { class: 'etq aviso' }, 'Todavía no se anotó cuántos se produjeron')));
+    if (!sinSaldo) tarjeta.addEventListener('click', () => {
+      if (marcado) elegidos.delete(l.id); else { elegidos.set(l.id, { unidades: '' }); enfocar = l.id; }
+      dibujar();
+    });
+    if (!marcado) return tarjeta;
+    const e = elegidos.get(l.id);
+    const campo = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: e.unidades, placeholder: 'ej. 10',
+      oninput: (ev) => { e.unidades = ev.target.value; } });
+    if (enfocar === l.id) setTimeout(() => campo.focus(), 50);
+    return [tarjeta, h('div', { class: 'tarjeta', style: 'margin-top:-.3rem;border:2px solid var(--ok)' },
+      h('label', { style: 'margin-top:0' }, '¿Cuántas unidades de este lote entran al Mix Bread?'), campo)];
+  };
+  const dibujar = () => {
+    const y = window.scrollY;
+    llenar(contenido, r.grupos.map((g) => [h('h2', null, g.producto),
+      g.lotes.length ? g.lotes.map(tarjetaPan) : h('p', { class: 'suave' }, 'No hay lotes de este pan de los últimos ' + r.dias + ' días.')]));
+    const fechas = todos.filter((l) => elegidos.has(l.id)).map((l) => l.fecha_vencimiento).sort();
+    venceTxt.hidden = !fechas.length;
+    venceTxt.textContent = fechas.length ? 'Este Mix Bread vencerá el ' + dia(fechas[0]) + ': la fecha más temprana de los panes elegidos.' : '';
+    window.scrollTo(0, y);
+    enfocar = null;
+  };
+  pintar(h('a', { class: 'volver', href: '#/hojas', onclick: (e) => { e.preventDefault(); vistaHojas(); } }, '← Hojas de producción'),
+    h('h1', null, 'Armar ' + r.producto.nombre),
+    h('p', { class: 'suave' }, 'Toca los lotes de pan que entran y escribe cuántas unidades de cada uno. Aparecen los panes que cocina terminó en los últimos ' + r.dias + ' días.'),
+    contenido, venceTxt,
+    h('div', { class: 'tarjeta' }, h('div', { class: 'en-linea' },
+      h('div', null, h('label', null, 'Paquetes de Mix Bread armados'), paquetes), h('div', null, h('label', null, 'Etiquetas a imprimir'), etiquetas)),
+    h('label', null, 'Observaciones'), obs),
+    h('div', { class: 'fila-botones' }, h('button', { class: 'boton ok', type: 'button', onclick: () => intentar(async () => {
+      if (!elegidos.size) throw new Error('Toca al menos un lote de pan.');
+      const items = [...elegidos].map(([origen_id, e]) => ({ origen_id, unidades: e.unidades }));
+      const hoja = await api('/mix/' + productoId, { items, unidades: paquetes.value, n_etiquetas: etiquetas.value, observaciones: obs.value });
+      avisar('Mix Bread registrado: lote ' + hoja.lote_final, 'bien');
+      location.hash = '#/hoja/' + hoja.id;
+    }) }, 'Registrar Mix Bread')));
+  dibujar();
+}
+
+function vistaHojaMix(p) {
+  pintar(h('img', { class: 'logo-impreso', src: '/static/logo.png', alt: '' }),
+    h('a', { class: 'volver no-imprimir', href: '#/hojas' }, '← Hojas de producción'),
+    h('div', { class: 'tarjeta hoja-cab' },
+      h('div', null, h('div', { class: 'chico suave' }, 'REGISTRO DE ARMADO'), h('h1', null, p.producto),
+        h('div', { class: 'lote-final' }, p.lote_final),
+        h('div', { class: 'chico suave' }, 'Armado ' + dia(p.fecha) + ' · Vence ' + dia(p.fecha_vencimiento) + ' (la fecha más temprana de sus panes)')),
+      h('div', { style: 'text-align:right' }, h('span', { class: 'etq ' + CLASE_ESTADO[p.estado] }, NOMBRE_ESTADO[p.estado]),
+        h('div', { class: 'chico suave' }, 'Armó ' + hora(p.iniciado_en), h('br'), p.iniciado_por || ''))),
+    h('div', { class: 'tabla-caja' }, h('table', null,
+      h('thead', null, h('tr', null, ['Pan', 'Lote', 'Unidades', 'Elaboración', 'Vence'].map((t) => h('th', null, t)))),
+      h('tbody', null, p.componentes.map((c) => h('tr', null, h('td', null, h('b', null, c.producto)),
+        h('td', { class: 'mono' }, h('a', { href: '#/hoja/' + c.origen_id }, h('b', null, c.lote_final))),
+        h('td', null, num(c.unidades)), h('td', null, dia(c.fecha)), h('td', null, dia(c.fecha_vencimiento))))))),
+    h('div', { class: 'tarjeta' }, h('p', null, h('b', null, 'Paquetes armados: '), p.unidades || '—', ' · ', h('b', null, 'Etiquetas: '), String(p.n_etiquetas)),
+      p.observaciones ? h('p', null, h('b', null, 'Observaciones: '), p.observaciones) : null),
+    h('div', { class: 'fila-botones no-imprimir' }, h('button', { class: 'boton', type: 'button', onclick: () => window.print() }, 'Imprimir'),
+      p.estado !== 'anulada' ? h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+        const motivo = await pedirTexto('Anular este Mix Bread', 'Motivo (las unidades de los panes vuelven a quedar disponibles)');
+        if (!motivo) return;
+        await api('/producciones/' + p.id + '/anular', { motivo }); avisar('Mix Bread anulado'); vistaHoja(p.id);
+      }) }, 'Anular') : null));
+}
+
+async function vistaHoja(id) {
+  const p = await api('/producciones/' + id);
+  if (p.armado) return vistaHojaMix(p);
+  const editable = p.estado === 'por_completar';      // en curso: solo lectura hasta que cocina avise que termino
+  const sub = !!p.produce_ingrediente_id;              // subreceta (relleno, glacé, masa madre): sin horneado
+  const unidadesSub = sub ? (await api('/bodega/catalogo')).unidades : [];
+  const campos = {};
+  const recoger = () => ({
+    unidades: campos.unidades.value, unidades_lote: sub ? '' : campos.unidades_lote.value, horneado: sub ? '' : campos.horneado.value,
+    observaciones: campos.observaciones.value, n_etiquetas: campos.n_etiquetas.value,
+    unidad_sub: sub ? campos.unidad_sub.value : undefined,
+    lineas: p.lineas.map((li) => ({ id: li.id, cantidad: campos['c' + li.id].value,
+      no_utilizado: campos['n' + li.id] ? campos['n' + li.id].checked : !!li.no_utilizado })),
+  });
+  const guardar = (cerrar) => intentar(async () => {
+    await api('/producciones/' + id + '/guardar', Object.assign(recoger(), { cerrar }));
+    avisar(cerrar ? 'Hoja completa' : 'Guardado', 'bien'); vistaHoja(id);
+  }).then((r) => { if (r === undefined && cerrar) vistaHoja(id); });
+
+  const agregarLote = (li) => intentar(async () => {
+    await api('/producciones/' + id + '/guardar', recoger());
+    const lotes = (await api('/lotes?donde=todos&ingrediente_id=' + li.ingrediente_id)).slice(0, 25);
+    const elegido = await modal('Agregar lote a ' + li.etiqueta,
+      h('div', null, h('p', { class: 'suave' }, 'Solo se puede elegir de la lista; no se escribe a mano.'),
+        lotes.length ? lotes.map((l) => tarjetaLote(l, { elegible: true,
+          alTocar: (e) => { const v = e.currentTarget.closest('.velo'); v.dataset.elegido = l.id; v.querySelector('.principal').click(); } }))
+          : h('p', null, 'No hay lotes de este ingrediente. Regístralo primero en Bodega secundaria o Cocina.')),
+      [{ texto: 'Agregar el lote tocado', clase: 'principal', valor: () => Number(document.querySelector('.velo').dataset.elegido) || null },
+        { texto: 'Cancelar', valor: null }]);
+    if (elegido) { await api('/producciones/' + id + '/agregar_lote', { linea_id: li.id, lote_id: elegido }); vistaHoja(id); }
+  });
+  const quitarLote = (l) => intentar(async () => {
+    const motivo = await pedirTexto('Quitar el lote ' + l.lote, '¿Por qué se quita? (queda registrado)');
+    if (!motivo) return;
+    await api('/producciones/' + id + '/guardar', recoger());
+    await api('/producciones/' + id + '/quitar_lote', { pl_id: l.pl_id, motivo }); vistaHoja(id);
+  });
+
+  const filaLinea = (li) => {
+    const vigentes = li.lotes.filter((l) => !l.quitado_en);
+    campos['c' + li.id] = h('input', { type: 'text', value: li.cantidad || '', placeholder: 'ej. 10 kg', disabled: !editable });
+    let celdaLotes;
+    if (li.tipo === 'no_aplica') celdaLotes = h('span', { class: 'suave' }, 'No aplica');
+    else {
+      if (!vigentes.length && editable) campos['n' + li.id] = h('input', { type: 'checkbox', checked: !!li.no_utilizado });
+      celdaLotes = h('div', null,
+        li.lotes.map((l) => h('span', { class: 'chip-lote' + (l.quitado_en ? ' quitado' : ''), title: l.quitado_en ? 'Quitado: ' + l.motivo
+          : [l.proveedor, l.fecha_ingreso && 'ingresó ' + dia(l.fecha_ingreso)].filter(Boolean).join(' · ') }, l.lote,
+        l.origen_lote === 'manual' && !l.quitado_en ? h('span', { class: 'etq rojo' }, 'a mano') : null,
+        editable && !l.quitado_en ? h('button', { type: 'button', class: 'no-imprimir', 'aria-label': 'Quitar lote', onclick: () => quitarLote(l) }, '×') : null)),
+        !vigentes.length && li.no_utilizado ? h('span', { class: 'suave' }, 'NO SE UTILIZÓ') : null,
+        li.falta_lote ? h('div', { class: 'etq rojo' }, 'Falta el lote: ábrelo en Cocina o agrégalo') : null,
+        editable ? h('div', { class: 'no-imprimir', style: 'margin-top:.3rem' },
+          h('button', { type: 'button', class: 'boton chico', onclick: () => agregarLote(li) }, '+ lote'),
+          campos['n' + li.id] ? h('label', { style: 'display:inline-flex;gap:.4rem;align-items:center;margin:0 0 0 .8rem;font-weight:400;white-space:nowrap' },
+            campos['n' + li.id], 'No se utilizó') : null) : null);
+    }
+    return h('tr', { class: li.falta_lote ? 'falta' : '' }, h('td', null, h('b', null, li.etiqueta)), h('td', null, celdaLotes),
+      h('td', { style: 'min-width:120px' }, campos['c' + li.id]));
+  };
+
+  const soloNum = (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; };
+  campos.unidades = h('input', { type: 'text', value: p.unidades, disabled: !editable, placeholder: sub ? 'Opcional, ej. 5' : 'ej. 240',
+    inputmode: sub ? 'decimal' : null, oninput: sub ? soloNum : null });
+  campos.unidad_sub = h('select', { disabled: !editable }, h('option', { value: '' }, '—'),
+    [...new Set([...unidadesSub, p.unidad_sub].filter(Boolean))].map((u) => h('option', { value: u, selected: u === p.unidad_sub }, u)));
+  campos.unidades_lote = h('input', { type: 'text', value: p.unidades_lote || '', disabled: !editable, placeholder: 'ej. 200' });
+  campos.horneado = h('input', { type: 'text', value: p.horneado, disabled: !editable, placeholder: 'ej. 180 °C · 18 min' });
+  campos.n_etiquetas = h('input', { type: 'number', min: '0', value: p.n_etiquetas, disabled: !editable });
+  campos.observaciones = h('textarea', { disabled: !editable }, p.observaciones);
+
+  pintar(h('img', { class: 'logo-impreso', src: '/static/logo.png', alt: '' }),
+    h('a', { class: 'volver no-imprimir', href: '#/hojas' }, '← Hojas de producción'),
+    h('div', { class: 'tarjeta hoja-cab' },
+      h('div', null, h('div', { class: 'chico suave' }, 'REGISTRO DE PRODUCCIÓN'), h('h1', null, p.producto),
+        h('div', { class: 'lote-final' }, p.lote_final),
+        h('div', { class: 'chico suave' }, 'Elaboración ' + dia(p.fecha) + ' · Vence ' + dia(p.fecha_vencimiento))),
+      h('div', { style: 'text-align:right' }, h('span', { class: 'etq ' + CLASE_ESTADO[p.estado] }, NOMBRE_ESTADO[p.estado]),
+        h('div', { class: 'chico suave' }, 'Inició ' + hora(p.iniciado_en), h('br'), p.iniciado_por || '',
+          p.terminado_en ? [h('br'), 'Terminó ' + hora(p.terminado_en)] : null,
+          p.completado_en ? [h('br'), 'Cerró ' + hora(p.completado_en) + ' · ' + (p.completado_por || '')] : null))),
+    p.estado === 'en_curso' ? h('div', { class: 'nota verde no-imprimir' }, 'Se está produciendo. Si en cocina se abre otro lote de estos ingredientes, se agrega solo a esta hoja. Cuando cocina avise que terminó, se podrán llenar las cantidades.') : null,
+    p.faltantes.length ? h('div', { class: 'nota rojo no-imprimir' }, 'Falta el lote de: ' + p.faltantes.join(', ') + '. La hoja no se puede cerrar así.') : null,
+    h('div', { class: 'tabla-caja' }, h('table', null,
+      h('thead', null, h('tr', null, h('th', null, 'Ingrediente'), h('th', null, 'Lote(s)'), h('th', null, 'Cantidad utilizada'))),
+      h('tbody', null, p.lineas.map(filaLinea)))),
+    h('div', { class: 'tarjeta' },
+      sub ? h('div', { class: 'en-linea' },
+        h('div', null, h('label', null, 'Cantidad total producida'), campos.unidades),
+        h('div', null, h('label', null, 'Unidad'), campos.unidad_sub),
+        h('div', null, h('label', null, 'Etiquetas a imprimir'), campos.n_etiquetas))
+      : h('div', { class: 'en-linea' },
+        h('div', null, h('label', null, 'Unidades producidas (total)'), campos.unidades),
+        h('div', null, h('label', null, 'Unidades para el lote de ' + p.producto.toLowerCase()), campos.unidades_lote),
+        h('div', null, h('label', null, 'Horneado (temperatura y tiempo)'), campos.horneado),
+        h('div', null, h('label', null, 'Etiquetas a imprimir'), campos.n_etiquetas)),
+      p.usado_mix.length ? h('p', { class: 'chico' }, h('b', null, 'Usadas en Mix Bread: ' + num(p.unidades_mix) + '. '),
+        p.usado_mix.map((u, i) => [i ? ', ' : '', h('a', { href: '#/hoja/' + u.produccion_id }, u.producto + ' ' + u.lote_final), ' (' + num(u.unidades) + ')'])) : null,
+      h('label', null, 'Observaciones'), campos.observaciones),
+    h('div', { class: 'fila-botones no-imprimir' },
+      p.estado === 'en_curso' ? h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+        if (!await confirmar('Marcar como terminada', 'Normalmente lo avisa cocina. Úsalo solo si cocina olvidó tocar «Terminó».', 'Marcar terminada')) return;
+        await api('/producciones/' + id + '/terminar', {}); avisar('Producción terminada', 'bien'); vistaHoja(id);
+      }) }, 'Cocina olvidó avisar: marcar terminada') : null,
+      editable ? h('button', { class: 'boton', type: 'button', onclick: () => guardar(false) }, 'Guardar') : null,
+      p.estado === 'por_completar' ? h('button', { class: 'boton ok', type: 'button', onclick: () => guardar(true) }, 'Guardar y cerrar hoja') : null,
+      p.estado === 'completa' ? h('button', { class: 'boton', type: 'button', onclick: () => intentar(async () => {
+        await api('/producciones/' + id + '/reabrir', {}); vistaHoja(id);
+      }) }, 'Reabrir para corregir') : null,
+      h('button', { class: 'boton', type: 'button', onclick: () => window.print() }, 'Imprimir'),
+      p.estado !== 'anulada' ? h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+        const motivo = await pedirTexto('Anular esta producción', 'Motivo (queda registrado)');
+        if (!motivo) return;
+        await api('/producciones/' + id + '/anular', { motivo }); location.hash = '#/produccion';
+      }) }, 'Anular') : null));
+}
+
+// ------------------------------------------------------------------ etiquetas
+// Rango de fechas de los periodos rápidos de Etiquetas (la semana empieza el lunes).
+function rangoPeriodo(periodo, hoy) {
+  const d = new Date(hoy + 'T12:00:00');
+  const iso = (x) => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
+  const mas = (x, n) => { const y = new Date(x); y.setDate(y.getDate() + n); return y; };
+  const lunes = mas(d, -((d.getDay() + 6) % 7));
+  if (periodo === 'semana') return [iso(lunes), hoy];
+  if (periodo === 'pasada') return [iso(mas(lunes, -7)), iso(mas(lunes, -1))];
+  if (periodo === 'mes') return [hoy.slice(0, 8) + '01', hoy];
+  return [hoy, hoy];
+}
+
+const filtroEtiquetas = {};          // recuerda el periodo elegido mientras la app está abierta
+
+async function vistaEtiquetas() {
+  const estado = await api('/estado');
+  const f = filtroEtiquetas;
+  if (!f.periodo) f.periodo = 'hoy';
+  if (f.periodo !== 'otro') [f.desde, f.hasta] = rangoPeriodo(f.periodo, estado.hoy);
+  const lista = await api('/etiquetas?desde=' + f.desde + '&hasta=' + f.hasta);
+  // Elegidas: todos los panes; las subrecetas solo si se marcan.
+  const elegidas = new Set(lista.filter((d) => !d.es_subreceta).map((d) => d.id));
+  const periodo = segmento([['hoy', 'Hoy'], ['semana', 'Esta semana'], ['pasada', 'Semana pasada'], ['mes', 'Este mes'], ['otro', 'Otras fechas']],
+    f.periodo, (v) => { f.periodo = v; vistaEtiquetas(); });
+  const cambiarFecha = (campo) => (e) => { f[campo] = e.target.value; if (f.desde > f.hasta) f[campo === 'desde' ? 'hasta' : 'desde'] = e.target.value; vistaEtiquetas(); };
+  const fechas = f.periodo === 'otro' ? h('div', { class: 'en-linea' },
+    h('div', null, h('label', null, 'Desde'), h('input', { type: 'date', value: f.desde, max: estado.hoy, onchange: cambiarFecha('desde') })),
+    h('div', null, h('label', null, 'Hasta'), h('input', { type: 'date', value: f.hasta, max: estado.hoy, onchange: cambiarFecha('hasta') }))) : null;
+  const botonExcel = h('button', { class: 'boton principal', type: 'button', onclick: () => bajar('xlsx') });
+  const botonCsv = h('button', { class: 'boton', type: 'button', onclick: () => bajar('csv') }, 'Descargar CSV');
+  const casillas = [];
+  const todas = h('input', { type: 'checkbox', title: 'Marcar todas', onchange: (e) => {
+    lista.forEach((d) => (e.target.checked ? elegidas.add(d.id) : elegidas.delete(d.id))); casillas.forEach((c) => { c.checked = e.target.checked; }); contar(); } });
+  const contar = () => {
+    const n = lista.filter((d) => elegidas.has(d.id)).reduce((t, d) => t + Number(d.n_etiquetas || 0), 0);
+    botonExcel.textContent = elegidas.size ? 'Descargar Excel para Zebra (' + elegidas.size + ' lote' + (elegidas.size > 1 ? 's' : '') + ', ' + n + ' etiqueta' + (n === 1 ? '' : 's') + ')' : 'Marca los lotes a imprimir';
+    botonExcel.disabled = botonCsv.disabled = !elegidas.size;
+    todas.checked = lista.length > 0 && elegidas.size === lista.length;
+  };
+  const bajar = (ext) => {
+    location.href = '/api/etiquetas.' + ext + '?desde=' + f.desde + '&hasta=' + f.hasta + '&subrecetas=1&ids=' + [...elegidas].join(',');
+  };
+  const varios = f.desde !== f.hasta;
+  pintar(encabezado('Etiquetas'),
+    periodo.el, fechas,
+    lista.length ? h('div', { class: 'tabla-caja', style: 'margin-top:1rem' }, h('table', null,
+      h('thead', null, h('tr', null, h('th', { style: 'width:2rem' }, todas), ['Lote', 'Producto', 'FE', 'FV', 'Etiquetas', 'Hoja'].map((t) => h('th', null, t)))),
+      h('tbody', null, lista.map((d, k) => {
+        const c = h('input', { type: 'checkbox', checked: elegidas.has(d.id), onchange: (e) => { e.target.checked ? elegidas.add(d.id) : elegidas.delete(d.id); contar(); } });
+        casillas.push(c);
+        const separa = varios && k > 0 && lista[k - 1].fecha !== d.fecha;
+        return h('tr', { class: separa ? 'otro-dia' : '' }, h('td', null, c), h('td', { class: 'mono' }, h('b', null, d.lote_final)),
+          h('td', null, d.producto, d.es_subreceta ? [' ', h('span', { class: 'etq gris' }, 'subreceta')] : null), h('td', { style: 'white-space:nowrap' }, d.fe), h('td', { style: 'white-space:nowrap' }, d.fv),
+          h('td', null, d.n_etiquetas), h('td', null, h('a', { href: '#/hoja/' + d.id }, h('span', { class: 'etq ' + CLASE_ESTADO[d.estado] }, NOMBRE_ESTADO[d.estado]))));
+      }))))
+      : h('p', { class: 'suave', style: 'margin-top:1rem' }, 'No hay producciones en ese periodo.'),
+    lista.length ? h('div', { class: 'fila-botones' }, botonExcel, botonCsv) : null,
+    h('div', { class: 'tarjeta chico', style: 'margin-top:1.4rem;display:flex;justify-content:space-between;align-items:center;gap:.8rem;flex-wrap:wrap' },
+      h('div', null, h('b', null, 'Todos los lotes desde que se usa la app'), h('div', { class: 'suave' }, 'Excel con cada lote, su producto, fechas, etiquetas y estado.')),
+      h('button', { class: 'boton', type: 'button', onclick: () => { location.href = '/api/etiquetas.xlsx?todo=1'; } }, 'Descargar historial')),
+    h('div', { class: 'tarjeta chico' }, h('b', null, 'Cómo imprimir sin volver a escribir los códigos'),
+      h('p', null, 'En ZebraDesigner Professional, conecta la plantilla de la etiqueta a este archivo como base de datos (columnas LOTE, PRODUCTO, FE, FV, CANTIDAD) e imprime todos los registros. La columna CANTIDAD indica cuántas etiquetas de cada lote.'),
+      h('p', null, 'Con la edición gratuita (Essentials) no hay conexión a base de datos: se imprime leyendo esta pantalla, sin pasar por la hoja de papel.')));
+  contar();
+}
+
+// ------------------------------------------------------------------ consulta
+function arbolProduccion(p) {
+  if (p.armado) {
+    return h('div', { class: 'tarjeta' },
+      h('div', null, h('b', { class: 'mono', style: 'font-size:1.15rem' }, p.lote_final), ' · ', p.producto, ' ',
+        h('span', { class: 'etq ' + CLASE_ESTADO[p.estado] }, NOMBRE_ESTADO[p.estado]), ' ', h('a', { href: '#/hoja/' + p.id, class: 'chico' }, 'ver hoja')),
+      h('div', { class: 'chico suave' }, 'Armado ' + dia(p.fecha) + ' · vence ' + dia(p.fecha_vencimiento) + (p.unidades ? ' · ' + p.unidades + ' paquetes' : '')),
+      p.componentes.map((c) => h('div', { class: 'arbol' },
+        h('p', { class: 'chico' }, h('b', null, num(c.unidades) + ' unidades'), ' de ' + c.producto + ' ' + c.lote_final),
+        c.produccion ? arbolProduccion(c.produccion) : null)));
+  }
+  return h('div', { class: 'tarjeta' },
+    h('div', null, h('b', { class: 'mono', style: 'font-size:1.15rem' }, p.lote_final), ' · ', p.producto, ' ',
+      h('span', { class: 'etq ' + CLASE_ESTADO[p.estado] }, NOMBRE_ESTADO[p.estado]), ' ', h('a', { href: '#/hoja/' + p.id, class: 'chico' }, 'ver hoja')),
+    h('div', { class: 'chico suave' }, 'Elaborado ' + dia(p.fecha) + (p.unidades ? ' · ' + p.unidades + ' unidades' : '') + ' · inició ' + hora(p.iniciado_en) + ' ' + (p.iniciado_por || '')),
+    h('div', { class: 'tabla-caja', style: 'margin-top:.5rem' }, h('table', null,
+      h('thead', null, h('tr', null, ['Ingrediente', 'Lote', 'Proveedor', 'Ingresó a bodega', 'Caduca'].map((t) => h('th', null, t)))),
+      h('tbody', null, p.lineas.map((li) => {
+        const vig = li.lotes.filter((l) => !l.quitado_en);
+        if (li.tipo === 'no_aplica') return h('tr', null, h('td', null, li.etiqueta), h('td', { colspan: '4', class: 'suave' }, 'No aplica'));
+        if (!vig.length) return h('tr', { class: li.no_utilizado ? '' : 'falta' }, h('td', null, li.etiqueta),
+          h('td', { colspan: '4' }, li.no_utilizado ? 'No se utilizó' : 'SIN LOTE REGISTRADO'));
+        return vig.map((l) => [h('tr', null, h('td', null, li.etiqueta), h('td', { class: 'mono' }, h('b', null, l.lote),
+          l.origen_lote === 'manual' ? h('span', { class: 'etq rojo' }, 'a mano') : null),
+        h('td', null, l.origen_lote === 'interno' ? 'Hecho en la panadería' : (l.proveedor || '—')), h('td', null, dia(l.fecha_ingreso) || '—'), h('td', null, dia(l.caducidad) || '—')),
+        (l.subproducciones || []).length ? h('tr', null, h('td', { colspan: '5' }, h('div', { class: 'arbol' }, l.subproducciones.map(arbolProduccion)))) : null]);
+      })))));
+}
+
+async function vistaConsulta() {
+  const campoPan = h('input', { type: 'search', placeholder: 'ej. 071026CR', autocapitalize: 'characters' });
+  const campoIng = h('input', { type: 'search', placeholder: 'ej. 291234' });
+  const salida = h('div', null);
+  const buscarPan = () => intentar(async () => {
+    const r = await api('/traza/final?lote=' + encodeURIComponent(campoPan.value));
+    llenar(salida, h('h2', null, 'Pan ' + r.lote + ': de qué está hecho'),
+      r.producciones.length ? h('div', null, r.producciones.length > 1 ? h('div', { class: 'nota' }, 'Hay ' + r.producciones.length + ' producciones con este mismo código de lote.') : null,
+        r.producciones.map(arbolProduccion)) : h('div', { class: 'nota rojo' }, 'No hay ninguna producción registrada con ese código.'));
+  });
+  const buscarIng = () => intentar(async () => {
+    const lotes = await api('/traza/ingrediente?q=' + encodeURIComponent(campoIng.value));
+    llenar(salida, h('h2', null, 'Lotes de ingrediente que coinciden con «' + campoIng.value + '»'),
+      lotes.length ? lotes.map((l) => h('div', { class: 'tarjeta' },
+        tarjetaLote(l, { conIngrediente: true, conNota: true, acciones: l.agotado ? h('button', { class: 'boton chico', type: 'button',
+          onclick: () => intentar(async () => { await api('/lotes/reactivar', { lote_id: l.id }); avisar('Lote reactivado', 'bien'); buscarIng(); }) }, 'Reactivar') : null }),
+        l.foto ? h('p', null, h('a', { href: '/fotos/' + l.foto, target: '_blank' }, 'Ver foto del empaque')) : null,
+        h('h3', null, 'Panes en los que se usó ', h('span', { class: 'num' + (l.usos.length ? ' rojo' : '') }, l.usos.length)),
+        l.usos.length ? h('div', { class: 'tabla-caja' }, h('table', null,
+          h('thead', null, h('tr', null, ['Lote del pan', 'Producto', 'Fecha', 'Unidades', 'Cómo llegó'].map((t) => h('th', null, t)))),
+          h('tbody', null, l.usos.map((u) => h('tr', null, h('td', { class: 'mono' }, h('a', { href: '#/hoja/' + u.produccion_id }, h('b', null, u.lote_final))),
+            h('td', null, u.producto, u.es_subreceta ? h('span', { class: 'etq gris' }, 'subreceta') : null), h('td', null, dia(u.fecha)), h('td', null, u.unidades || '—'),
+            h('td', { class: 'chico' }, u.via.length ? 'a través de ' + u.via.join(' → ') : 'directo (' + u.renglon + ')'))))))
+          : h('p', { class: 'suave' }, 'No aparece en ninguna hoja de producción.'),
+        l.salidas_areas && l.salidas_areas.length ? h('p', { class: 'chico' }, h('b', null, 'También salió de bodega principal a otras áreas: '),
+          l.salidas_areas.map((o) => num(o.cantidad) + (o.unidad ? ' ' + o.unidad : '') + ' ' + (o.area === 'AJUSTE' ? 'cierre del lote (' + o.motivo + ')' : 'a ' + o.area)
+            + ' el ' + hora(o.fecha_hora)).join('; ')) : null,
+        l.bajas && l.bajas.length ? h('div', { class: 'chico', style: 'margin:.4rem 0' }, h('b', { style: 'color:var(--alerta)' }, 'Dado de baja: '),
+          l.bajas.map((b) => h('div', null, '• ' + ({ principal: 'Bodega principal', secundaria: 'Bodega secundaria', cocina: 'Cocina' }[b.lugar]) + ', '
+            + hora(b.fecha_hora) + ': ' + b.motivo.split(':')[0].toLowerCase() + (b.cantidad ? ' · ' + num(b.cantidad) + (b.unidad ? ' ' + b.unidad : '') : '')
+            + (b.comentario ? ' · ' + b.comentario : '') + (b.persona ? ' · ' + b.persona : ''), ' ',
+          b.id ? h('button', { class: 'boton chico peligro', type: 'button', style: 'padding:.1rem .5rem', onclick: () => intentar(async () => {
+            const motivo = await pedirTexto('Anular la baja del lote ' + l.lote, 'Motivo (queda registrado)');
+            if (!motivo) return;
+            await api('/bajas/' + b.id + '/anular', { motivo }); avisar('Baja anulada', 'bien'); buscarIng();
+          }) }, 'Anular') : null))) : null,
+        l.aperturas.length ? h('p', { class: 'chico suave' }, 'En cocina: ' + l.aperturas.map((a) => hora(a.abierto_en) + ' → ' + (a.cerrado_en ? hora(a.cerrado_en) : 'sigue abierto')).join('; ')) : null))
+        : h('div', { class: 'nota rojo' }, 'No hay lotes con ese texto.'));
+  });
+  campoPan.addEventListener('keydown', (e) => { if (e.key === 'Enter') buscarPan(); });
+  campoIng.addEventListener('keydown', (e) => { if (e.key === 'Enter') buscarIng(); });
+  pintar(encabezado('Consultar trazabilidad'),
+    h('div', { class: 'tarjeta' }, h('label', null, 'Tengo un pan y quiero saber de qué lotes está hecho'),
+      h('div', { class: 'en-linea' }, campoPan, h('button', { class: 'boton principal', type: 'button', onclick: buscarPan }, 'Buscar'))),
+    h('div', { class: 'tarjeta' }, h('label', null, 'Tengo un lote de ingrediente y quiero saber en qué panes se usó'),
+      h('div', { class: 'en-linea' }, campoIng, h('button', { class: 'boton principal', type: 'button', onclick: buscarIng }, 'Buscar'))),
+    salida);
+}
+
+// ------------------------------------------------------------------ administrar
+const PESTANAS = [['importar', 'Importar Excel antiguo'], ['pendientes', 'Pendientes'], ['bodega', 'Productos de bodega'], ['recetas', 'Recetas'],
+  ['ingredientes', 'Ingredientes'], ['personas', 'Personas'], ['claves', 'Contraseñas'], ['historial', 'Historial']];
+
+async function vistaAdmin(pestana) {
+  pestana = pestana || 'importar';
+  const cuerpoPestana = h('div', null, h('p', { class: 'suave' }, 'Cargando…'));
+  pintar(encabezado('Administrar'),
+    h('div', { class: 'pestanas' }, PESTANAS.map(([id, nombre]) => h('button', { type: 'button', class: id === pestana ? 'activa' : '',
+      onclick: () => { location.hash = '#/admin/' + id; } }, nombre))), cuerpoPestana);
+  const poner = (...n) => llenar(cuerpoPestana, ...n);
+  const recargar = () => vistaAdmin(pestana);
+  const ings = await api('/ingredientes');
+  const selectorIngrediente = (valor, soloProveedor) => h('select', null, h('option', { value: '' }, '— elegir ingrediente —'),
+    ings.filter((i) => !soloProveedor || i.tipo === 'lote').map((i) => h('option', { value: i.id, selected: i.id === valor }, i.nombre)));
+
+  if (pestana === 'importar') {
+    const archivo = h('input', { type: 'file', accept: '.xlsx' });
+    const resultado = h('div', null);
+    const fecha = h('input', { type: 'date' });
+    poner(h('div', { class: 'tarjeta' }, h('h2', { style: 'margin-top:0' }, 'Importar registros anteriores de bodega principal'),
+      h('p', { class: 'suave' }, 'Solo para cargar lo que se registró en Excel antes de usar la app. Desde ahora, bodega principal registra cada recepción en la pantalla «Bodega principal». Las filas ya importadas o ya registradas en la app no se duplican.'),
+      archivo, h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: () => intentar(async () => {
+        if (!archivo.files[0]) throw new Error('Elige el archivo Excel.');
+        if (!quien()) { await elegirPersona(); if (!quien()) return; }
+        const resp = await fetch('/api/importar?persona=' + encodeURIComponent(quien()), { method: 'POST', body: archivo.files[0] });
+        const r = await resp.json();
+        if (!resp.ok) throw new Error(r.error);
+        llenar(resultado, h('div', { class: 'nota verde' }, 'Hoja «' + r.hoja + '»: ' + r.filas_leidas + ' filas leídas · ' + r.recepciones_nuevas +
+          ' recepciones nuevas · ' + r.lotes_nuevos + ' lotes nuevos · ' + r.ya_importadas + ' ya estaban.'),
+        r.por_asignar ? h('div', { class: 'nota' }, r.por_asignar + ' producto(s) de bodega sin ingrediente asignado. ', h('a', { href: '#/admin/pendientes' }, 'Asignarlos')) : null,
+        r.sin_lote.length ? h('div', { class: 'nota rojo' }, 'Filas sin lote (no se importaron): ' + r.sin_lote.map((s) => 'fila ' + s.fila + ' ' + s.producto + ' (' + dia(s.fecha) + ')').join('; ')) : null);
+      }) }, 'Importar')), resultado),
+    h('div', { class: 'tarjeta' }, h('h2', { style: 'margin-top:0' }, 'Puesta en marcha: limpiar lotes viejos'),
+      h('p', { class: 'suave' }, 'La primera importación trae lotes de hace meses que ya no existen. Márcalos como agotados para que no aparezcan en las listas (siguen en el historial y se pueden reactivar).'),
+      h('div', { class: 'en-linea' }, h('div', null, h('label', null, 'Agotar los lotes ingresados antes del'), fecha),
+        h('button', { class: 'boton', type: 'button', onclick: () => intentar(async () => {
+          const r = await api('/admin/agotar_antiguos', { antes_de: fecha.value }); avisar(r.lotes + ' lotes marcados como agotados', 'bien');
+        }) }, 'Marcar como agotados'))),
+    h('div', { class: 'tarjeta' }, h('h2', { style: 'margin-top:0' }, 'Respaldo'),
+      h('p', { class: 'suave' }, 'Toda la información está en un solo archivo. Se guarda una copia automática por día en la carpeta datos/respaldos.'),
+      h('a', { class: 'boton', href: '/api/respaldo' }, 'Descargar copia de la base de datos')));
+  }
+
+  if (pestana === 'pendientes') {
+    const pen = await api('/pendientes');
+    poner(h('h2', null, 'Productos de bodega sin ingrediente ', h('span', { class: 'num' + (pen.alias.length ? ' rojo' : '') }, pen.alias.length)),
+      h('p', { class: 'suave chico' }, 'Mientras no se asignen, sus lotes no aparecen en ninguna lista.'),
+      pen.alias.map((a) => filaAlias(a)),
+      h('h2', null, 'Lotes por revisar ', h('span', { class: 'num' + (pen.lotes.length ? ' rojo' : '') }, pen.lotes.length)),
+      pen.lotes.map((l) => tarjetaLote(l, { conIngrediente: true, conNota: true, acciones: h('div', { style: 'display:grid;gap:.3rem' },
+        l.foto ? h('a', { class: 'boton chico', href: '/fotos/' + l.foto, target: '_blank' }, 'Foto') : null,
+        h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => { await api('/lotes/revisado', { lote_id: l.id }); recargar(); }) }, 'Está bien'),
+        l.origen === 'manual' ? h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+          const otros = (await api('/lotes?donde=todos&ingrediente_id=' + l.ingrediente_id)).filter((o) => o.id !== l.id).slice(0, 25);
+          const destino = await modal('«' + l.lote + '» en realidad es…', h('div', null, h('p', { class: 'suave' }, 'Toca el lote correcto de la lista de bodega. Todo lo registrado con el lote anotado a mano pasará a ese lote.'),
+            otros.map((o) => tarjetaLote(o, { elegible: true, alTocar: (e) => { const v = e.currentTarget.closest('.velo'); v.dataset.elegido = o.id; v.querySelector('.principal').click(); } }))),
+          [{ texto: 'Unir con el lote tocado', clase: 'principal', valor: () => Number(document.querySelector('.velo').dataset.elegido) || null }, { texto: 'Cancelar', valor: null }]);
+          if (destino) { await api('/lotes/fusionar', { lote_id: l.id, destino_id: destino }); avisar('Lotes unidos', 'bien'); recargar(); }
+        }) }, 'Es otro de la lista') : null) })),
+      h('h2', null, 'Hojas con lotes faltantes ', h('span', { class: 'num' + (pen.hojas.length ? ' rojo' : '') }, pen.hojas.length)),
+      pen.hojas.map(tarjetaProduccion));
+  }
+
+  const cambiarFoto = (a) => {
+    const subir = h('input', { type: 'file', accept: 'image/*', hidden: true });
+    subir.addEventListener('change', () => intentar(async () => {
+      const archivo = subir.files[0]; if (!archivo) return;
+      avisar('Subiendo la foto y quitando el fondo…');
+      const resp = await fetch('/api/bodega/productos/' + a.id + '/foto?persona=' + encodeURIComponent(quien()), { method: 'POST', body: archivo });
+      const r = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(r.error || 'No se pudo guardar la foto.');
+      avisar(r.sin_fondo ? 'Foto guardada sin fondo' : 'Foto guardada (no se pudo quitar el fondo automáticamente)', 'bien'); recargar();
+    }));
+    document.body.append(subir); subir.click(); setTimeout(() => subir.remove(), 60000);
+  };
+  function filaAlias(a) {
+    const sel = selectorIngrediente(a.ingrediente_id, true);
+    const foto = a.en_catalogo ? h('div', { class: 'foto-admin' }, fotoProducto(a.foto, a.producto),
+      h('button', { class: 'boton chico', type: 'button', onclick: () => cambiarFoto(a) }, a.foto ? 'Cambiar foto' : 'Poner foto'),
+      a.foto ? h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+        await api('/bodega/productos/' + a.id + '/foto/quitar', {}); recargar(); }) }, 'Quitar foto') : null) : null;
+    return h('div', { class: 'tarjeta fila-producto' + (foto ? ' con-foto' : '') }, foto,
+      h('div', { class: 'datos-producto' },
+        h('div', { class: 'titulo-producto' }, h('b', null, a.producto), h('span', { class: 'chico suave' }, a.recepciones + ' recepción(es)')),
+        h('div', { class: 'etiquetas-producto' },
+          a.ignorar ? h('span', { class: 'etq gris' }, 'Ignorado') : null, a.auto ? h('span', { class: 'etq aviso' }, 'Asignado automáticamente') : null,
+          a.en_catalogo ? h('span', { class: 'etq verde' }, 'En la lista de bodega') : null),
+        h('div', { class: 'asignar-producto' }, sel,
+          h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+            if (!sel.value) throw new Error('Elige un ingrediente.');
+            await api('/alias/' + a.id, { ingrediente_id: Number(sel.value) }); recargar();
+          }) }, 'Asignar')),
+        h('div', { class: 'botones-producto' },
+          h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+            const nombre = await pedirTexto('Ingrediente nuevo', 'Nombre como debe salir en la hoja de producción', a.producto);
+            if (!nombre) return;
+            const frio = await modal('¿Dónde se guarda?', h('p', null, nombre), [{ texto: 'Seco', clase: 'principal', valor: 'seco' }, { texto: 'Refrigerado', valor: 'frio' }]);
+            if (!frio) return;
+            await api('/alias/' + a.id, { nuevo: nombre, refrigerado: frio === 'frio' }); recargar();
+          }) }, 'Ingrediente nuevo'),
+          h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => { await api('/alias/' + a.id, { ignorar: true }); recargar(); }) }, 'No se usa en panadería'),
+          h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+            await api('/bodega/productos/' + a.id + '/lista', { en_lista: !a.en_catalogo }); recargar();
+          }) }, a.en_catalogo ? 'Quitar de la lista de bodega' : 'Poner en la lista de bodega'))));
+  }
+
+  if (pestana === 'bodega') {
+    const lista = await api('/alias');
+    poner(h('p', { class: 'suave' }, 'Cada nombre de producto que aparece en el Excel de bodega y el ingrediente de la hoja de producción al que corresponde.'),
+      lista.map(filaAlias));
+  }
+
+  if (pestana === 'recetas') {
+    const productos = await api('/productos');
+    const editar = (p) => {
+      p = p || { nombre: '', codigo: '', vida_util_meses: 1, lineas: [], activo: 1 };
+      const nombre = h('input', { type: 'text', value: p.nombre });
+      const codigo = h('input', { type: 'text', value: p.codigo, placeholder: 'ej. CR' });
+      const meses = h('input', { type: 'number', min: '0', value: p.vida_util_meses });
+      const dias = h('input', { type: 'number', min: '1', value: p.vida_util_dias || 7 });
+      const sub = h('input', { type: 'checkbox', checked: !!p.produce_ingrediente_id, onchange: () => alternarVida() });
+      const cajaMeses = h('div', null, h('label', null, 'Vida útil (meses)'), meses);
+      const cajaDias = h('div', null, h('label', null, 'Vida útil (días)'), dias);
+      const alternarVida = () => { cajaMeses.hidden = sub.checked; cajaDias.hidden = !sub.checked; };
+      const arm = h('input', { type: 'checkbox', checked: !!p.armado, onchange: () => alternar() });
+      let componentes = (p.componentes || []).map((c) => c.id);
+      const panes = productos.filter((x) => !x.armado && !x.produce && x.id !== p.id);
+      const cajaComp = h('div', null);
+      const dibujarComp = () => cajaComp.replaceChildren(...componentes.map((cid, i) => {
+        const sel = h('select', { onchange: (e) => { componentes[i] = Number(e.target.value) || null; } }, h('option', { value: '' }, '— elegir pan —'),
+          panes.map((x) => h('option', { value: x.id, selected: x.id === cid }, x.nombre)));
+        return h('div', { class: 'en-linea', style: 'margin:.4rem 0' }, sel,
+          h('button', { class: 'boton chico peligro', type: 'button', onclick: () => { componentes.splice(i, 1); dibujarComp(); } }, 'Quitar'));
+      }));
+      const seccionReceta = h('div', null);
+      const seccionMix = h('div', null, h('h3', null, 'Panes que forman la mezcla'), cajaComp,
+        h('button', { class: 'boton chico', type: 'button', onclick: () => { componentes.push(null); dibujarComp(); } }, '+ pan'));
+      const alternar = () => { seccionMix.hidden = !arm.checked; seccionReceta.hidden = arm.checked; };
+      const inactivo = h('input', { type: 'checkbox', checked: p.id && !p.activo });
+      let lineas = p.lineas.map((l) => ({ etiqueta: l.etiqueta, ingrediente_id: l.ingrediente_id }));
+      const caja = h('div', null);
+      const dibujarLineas = () => caja.replaceChildren(...lineas.map((l, i) => {
+        const sel = selectorIngrediente(l.ingrediente_id);
+        sel.addEventListener('change', () => { l.ingrediente_id = Number(sel.value) || null; });
+        const et = h('input', { type: 'text', value: l.etiqueta, placeholder: 'Nombre en la hoja (opcional)', oninput: (e) => { l.etiqueta = e.target.value; } });
+        return h('div', { class: 'en-linea', style: 'margin:.4rem 0' }, sel, et,
+          h('button', { class: 'boton chico', type: 'button', disabled: i === 0, onclick: () => { [lineas[i - 1], lineas[i]] = [lineas[i], lineas[i - 1]]; dibujarLineas(); } }, '↑'),
+          h('button', { class: 'boton chico peligro', type: 'button', onclick: () => { lineas.splice(i, 1); dibujarLineas(); } }, 'Quitar'));
+      }));
+      dibujarLineas();
+      dibujarComp();
+      llenar(seccionReceta, h('h3', null, 'Ingredientes, en el orden de la hoja'), caja,
+        h('button', { class: 'boton chico', type: 'button', onclick: () => { lineas.push({ etiqueta: '', ingrediente_id: null }); dibujarLineas(); } }, '+ ingrediente'));
+      alternar(); alternarVida();
+      poner(h('button', { class: 'boton chico', type: 'button', onclick: recargar }, '← Todas las recetas'),
+        h('div', { class: 'tarjeta' }, h('div', { class: 'en-linea' },
+          h('div', null, h('label', null, 'Producto'), nombre), h('div', null, h('label', null, 'Código del lote'), codigo),
+          cajaMeses, cajaDias),
+        h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' }, sub, 'Es una subreceta: su lote se usa como ingrediente de otros panes'),
+        h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' }, arm, 'Es un Mix Bread: se arma con panes ya producidos (sin receta)'),
+        p.id ? h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' }, inactivo, 'Ya no se produce (ocultar)') : null,
+        seccionMix, seccionReceta,
+        h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: () => intentar(async () => {
+          await api('/productos', { id: p.id, nombre: nombre.value, codigo: codigo.value, vida_util_meses: meses.value, vida_util_dias: dias.value, es_subreceta: sub.checked,
+            inactivo: inactivo.checked, lineas, armado: arm.checked, componentes: componentes.filter(Boolean) });
+          avisar('Receta guardada', 'bien'); recargar();
+        }) }, 'Guardar receta'))));
+    };
+    poner(h('p', { class: 'suave' }, 'La receta decide qué renglones tiene la hoja y qué lotes se anotan solos. Los cambios valen para las producciones nuevas.'),
+      h('button', { class: 'boton chico', type: 'button', onclick: () => editar(null) }, '+ Producto nuevo'),
+      productos.map((p) => h('div', { class: 'tarjeta', style: p.activo ? '' : 'opacity:.55' },
+        h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem' },
+          h('div', null, h('b', null, p.nombre), ' ', h('span', { class: 'etq gris mono' }, p.codigo), p.produce ? h('span', { class: 'etq aviso' }, 'subreceta') : null,
+            p.armado ? h('span', { class: 'etq verde' }, 'Mix Bread') : null,
+            h('div', { class: 'chico suave' }, p.armado ? 'Panes: ' + (p.componentes.map((c) => c.nombre).join(' · ') || 'sin definir')
+              : p.lineas.length ? p.lineas.map((l) => l.etiqueta).join(' · ') : 'Sin receta: no se puede iniciar su producción.')),
+          h('button', { class: 'boton chico', type: 'button', onclick: () => editar(p) }, 'Editar')))));
+  }
+
+  if (pestana === 'ingredientes') {
+    const nuevo = h('input', { type: 'text', placeholder: 'Nombre del ingrediente' });
+    const tipo = h('select', null, h('option', { value: 'lote' }, 'De proveedor (con lote)'), h('option', { value: 'no_aplica' }, 'Sin lote (como el agua)'));
+    poner(h('p', { class: 'suave' }, 'Refrigerado es solo informativo (se guarda en refrigeración). Todos los ingredientes de proveedor pasan por bodega secundaria antes de cocina.'),
+      h('p', { class: 'suave chico' }, 'En cocina: en cuántos recipientes se guarda, o si se usa directo de su empaque. Al poner un lote nuevo, la app pregunta si el anterior se acabó o se mezclan.'),
+      h('div', { class: 'tabla-caja' }, h('table', null, h('thead', null, h('tr', null, ['Ingrediente', 'En cocina', 'Tipo', 'Refrigerado'].map((t) => h('th', null, t)))),
+        h('tbody', null, ings.map((i) => h('tr', null, h('td', null, i.nombre),
+          h('td', null, i.tipo === 'no_aplica' ? '—' : h('select', { style: 'min-height:40px', onchange: (e) => intentar(async () => {
+            await api('/ingredientes', { id: i.id, recipientes: Number(e.target.value) }); avisar('Guardado', 'bien');
+          }).then((r) => { if (r === undefined) recargar(); }) },
+          [[0, 'Su propio empaque'], [1, '1 recipiente'], [2, '2 recipientes'], [3, '3 recipientes']].map(([v, t]) =>
+            h('option', { value: v, selected: (i.recipientes ?? 1) === v }, t)))),
+          h('td', null, { lote: 'De proveedor', interno: 'Subreceta', no_aplica: 'Sin lote' }[i.tipo]),
+          h('td', null, i.tipo === 'lote' ? h('input', { type: 'checkbox', checked: !!i.refrigerado, onchange: (e) => intentar(async () => {
+            await api('/ingredientes', { id: i.id, refrigerado: e.target.checked }); avisar('Guardado', 'bien');
+          }) }) : '—')))))),
+      h('div', { class: 'tarjeta' }, h('div', { class: 'en-linea' }, h('div', null, h('label', null, 'Agregar ingrediente'), nuevo), h('div', null, h('label', null, 'Tipo'), tipo),
+        h('button', { class: 'boton', type: 'button', onclick: () => intentar(async () => { await api('/ingredientes', { nombre: nuevo.value, tipo: tipo.value }); recargar(); }) }, 'Agregar'))));
+  }
+
+  if (pestana === 'claves') {
+    const est = await api('/claves');
+    const campos = {};
+    const fila = (x) => {
+      campos[x.area] = h('input', { type: 'password', autocomplete: 'new-password', placeholder: est.activas ? 'Nueva contraseña' : 'Contraseña' });
+      return h('div', null, h('label', null, x.nombre), campos[x.area],
+        est.activas && x.cambiado_en ? h('div', { class: 'chico suave' }, 'Cambiada el ' + hora(x.cambiado_en)) : null);
+    };
+    const guardar = () => intentar(async () => {
+      const claves = {};
+      Object.entries(campos).forEach(([a, c]) => { if (c.value) claves[a] = c.value; });
+      await api('/claves', { claves });
+      sesion.requiere = true; sesion.area = 'produccion';
+      avisar(est.activas ? 'Contraseña cambiada' : 'Contraseñas activadas', 'bien'); recargar();
+    });
+    poner(h('p', { class: 'suave' }, est.activas
+      ? 'Cada área entra con su contraseña. Escribe solo la que quieras cambiar (mínimo 4 caracteres).'
+      : 'Ahora nadie necesita contraseña. Para activarlas, escribe una para cada área (mínimo 4 caracteres).'),
+    h('div', { class: 'tarjeta', style: 'max-width:480px' }, est.areas.map(fila),
+      h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: guardar }, est.activas ? 'Cambiar' : 'Activar contraseñas'))));
+    return;
+  }
+  if (pestana === 'personas') {
+    const personas = await api('/personas');
+    const nombre = h('input', { type: 'text', placeholder: 'Nombre y apellido' });
+    const rol = h('input', { type: 'text', placeholder: 'ej. Chef, Encargado de producción' });
+    poner(personas.map((p) => h('div', { class: 'lote' }, h('div', { class: 'datos' }, h('b', null, p.nombre), p.rol ? h('div', { class: 'chico suave' }, p.rol) : null),
+      h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => { await api('/personas', { eliminar_id: p.id }); recargar(); }) }, 'Quitar'))),
+    h('div', { class: 'tarjeta' }, h('div', { class: 'en-linea' }, h('div', null, h('label', null, 'Nombre'), nombre), h('div', null, h('label', null, 'Cargo'), rol),
+      h('button', { class: 'boton', type: 'button', onclick: () => intentar(async () => { await api('/personas', { nombre: nombre.value, rol: rol.value }); recargar(); }) }, 'Agregar'))));
+  }
+
+  if (pestana === 'historial') {
+    const mov = await api('/movimientos');
+    poner(h('p', { class: 'suave' }, 'Los últimos 300 registros. Nada de esto se puede borrar ni editar.'),
+      h('div', { class: 'tabla-caja' }, h('table', null, h('thead', null, h('tr', null, ['Cuándo', 'Quién', 'Qué', 'Detalle'].map((t) => h('th', null, t)))),
+        h('tbody', null, mov.map((m) => h('tr', null, h('td', { class: 'chico', style: 'white-space:nowrap' }, hora(m.fecha_hora)), h('td', { class: 'chico' }, m.persona || ''),
+          h('td', { class: 'chico' }, m.tipo.replace(/_/g, ' ').toLowerCase()), h('td', { class: 'chico' }, m.detalle,
+            m.produccion_id ? [' ', h('a', { href: '#/hoja/' + m.produccion_id }, 'hoja')] : null)))))));
+  }
+}
+
+// ------------------------------------------------------------------ rutas
+// Pantalla para escribir la contraseña del área de este dispositivo.
+function vistaClave() {
+  const a = AREAS[area()];
+  const clave = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Contraseña' });
+  const entrar = () => intentar(async () => {
+    if (!clave.value) throw new Error('Escribe la contraseña.');
+    const r = await api('/entrar', { area: area(), clave: clave.value });
+    sesion.area = r.area; pintarArea(); navegar();
+  });
+  clave.addEventListener('keydown', (e) => { if (e.key === 'Enter') entrar(); });
+  pintar(h('div', { class: 'nombre-app nombre-inicio' }, 'Traza', h('b', null, 'Pan'), 'USFQ'),
+    h('h1', null, a.nombre),
+    h('div', { class: 'tarjeta', style: 'max-width:420px' },
+      h('label', { style: 'margin-top:0' }, 'Contraseña de ' + a.nombre), clave,
+      h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: entrar }, 'Entrar'))),
+    h('div', { class: 'fila-botones' }, h('button', { class: 'boton chico', type: 'button', onclick: () => cambiarArea() }, 'Cambiar de área')));
+  setTimeout(() => clave.focus(), 50);
+}
+
+async function navegar() {
+  const partes = location.hash.replace(/^#\/?/, '').split('/');
+  document.querySelectorAll('.velo').forEach((v) => v.remove());
+  paginaHorizontal(false);
+  $vista.classList.remove('ancho');
+  const rutas = { '': vistaInicio, bodega: vistaBodega, salidas: () => vistaSalidas(partes[1]), secundaria: () => vistaSecundaria(partes[1]), cocina: vistaCocina, produccion: vistaProduccion, hojas: vistaHojas,
+    hoja: () => vistaHoja(Number(partes[1])), etiquetas: () => vistaEtiquetas(), consulta: vistaConsulta, admin: () => vistaAdmin(partes[1]) };
+  const vista = rutas[partes[0]] || vistaInicio;
+  if (!area()) { vistaInicio(); return; }
+  if (necesitaClave()) { vistaClave(); return; }
+  try { if (!quien()) await elegirPersona(); await vista(); } catch (e) {
+    pintar(encabezado('No se pudo cargar'), h('div', { class: 'nota rojo' }, e.message),
+      h('button', { class: 'boton', type: 'button', onclick: navegar }, 'Reintentar'));
+  }
+}
+window.addEventListener('hashchange', navegar);
+(async () => {
+  try { Object.assign(sesion, await (await fetch('/api/sesion')).json()); } catch (e) { /* sin conexión: navegar mostrará el error */ }
+  pintarQuien();
+  pintarArea();
+  navegar();
+})();
