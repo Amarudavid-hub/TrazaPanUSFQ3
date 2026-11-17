@@ -1,7 +1,8 @@
 /* TrazaPan - estilos. Pensado para celular/tablet en cocina: botones grandes y alto contraste. */
 :root {
-  --tinta: #2b211a; --tinta-suave: #6b5d52; --fondo: #f6f1e8; --papel: #fffdf9; --linea: #e2d8c8;
-  --trigo: #b8650f; --trigo-claro: #fbead2; --ok: #2c7a4b; --ok-claro: #e1f2e7;
+  /* Colores del sistema: azul marino #2C344E y blancos */
+  --tinta: #1f2538; --tinta-suave: #5f677b; --fondo: #f2f4f8; --papel: #ffffff; --linea: #dce1ea;
+  --trigo: #2C344E; --trigo-claro: #e6eaf3; --trigo-hover: #1d2336; --acento: #5a78b0; --gris-claro: #e9edf3; --ok: #2c7a4b; --ok-claro: #e1f2e7;
   --alerta: #b23a2e; --alerta-claro: #fbe6e3; --aviso: #8a6100; --aviso-claro: #fff3cd;
   --radio: 14px; --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
 }
@@ -22,7 +23,7 @@ a { color: var(--trigo); }
 .marca { display: flex; align-items: center; gap: .7rem; color: var(--tinta); text-decoration: none; min-width: 0; }
 .logo-barra { height: 34px; width: auto; display: block; }
 .nombre-app { font-weight: 800; font-size: 1.2rem; letter-spacing: -.02em; color: var(--tinta); border-left: 1px solid var(--linea); padding-left: .7rem; }
-.nombre-app b { color: var(--trigo); }
+.nombre-app b { color: var(--acento); }
 .nombre-inicio { display: none; margin-bottom: .3rem; }
 @media (max-width: 600px) { .barra .nombre-app { display: none; } .nombre-inicio { display: inline-block; border: 0; padding: 0; }
   .barra { padding: .5rem .6rem; gap: .35rem; } .logo-barra { height: 24px; } .chip-persona { padding: .3rem .6rem; font-size: .8rem; } }
@@ -30,7 +31,11 @@ a { color: var(--trigo); }
 .logo-impreso { display: none; }
 
 main { max-width: 860px; margin: 0 auto; padding: 1rem 1rem 6rem; }
-.volver { display: inline-block; margin-bottom: .6rem; text-decoration: none; font-weight: 600; }
+.volver { display: inline-flex; align-items: center; gap: .45rem; margin-bottom: .9rem; padding: .55rem 1.1rem .55rem .8rem;
+  background: var(--trigo); color: #fff; border-radius: 999px; text-decoration: none; font-weight: 700; font-size: 1rem;
+  box-shadow: 0 2px 6px rgba(44, 52, 78, .28); min-height: 44px; }
+.volver:hover, .volver:focus-visible { background: var(--trigo-hover); color: #fff; }
+.volver:active { transform: translateY(1px); }
 
 /* Botones */
 button, .boton { font: inherit; cursor: pointer; }
@@ -81,7 +86,7 @@ button, .boton { font: inherit; cursor: pointer; }
 .etq.aviso { background: var(--aviso-claro); color: var(--aviso); }
 .etq.rojo { background: var(--alerta-claro); color: var(--alerta); }
 .etq.verde { background: var(--ok-claro); color: var(--ok); }
-.etq.gris { background: #ece6db; color: var(--tinta-suave); }
+.etq.gris { background: var(--gris-claro); color: var(--tinta-suave); }
 .nota { background: var(--aviso-claro); color: #5c4200; border-radius: 10px; padding: .6rem .8rem; margin: .6rem 0; font-size: .92rem; }
 .nota.rojo { background: var(--alerta-claro); color: #7a241b; }
 .nota.verde { background: var(--ok-claro); color: #1d5433; }
@@ -94,7 +99,7 @@ label { display: block; font-weight: 600; margin: .7rem 0 .25rem; }
 input[type=text], input[type=password], input[type=date], input[type=month], input[type=number], input[type=search], select, textarea {
   width: 100%; min-height: 48px; padding: .5rem .7rem; font: inherit; color: inherit; background: #fff; border: 2px solid var(--linea); border-radius: 10px; }
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--trigo); }
-input:disabled, textarea:disabled, select:disabled { background: #efe9df; color: var(--tinta-suave); border-color: #e6dfd2; }
+input:disabled, textarea:disabled, select:disabled { background: #eef1f5; color: var(--tinta-suave); border-color: var(--linea); }
 input:disabled::placeholder, textarea:disabled::placeholder { color: transparent; }
 textarea { min-height: 80px; }
 .en-linea { display: flex; gap: .6rem; align-items: end; flex-wrap: wrap; }
@@ -105,7 +110,7 @@ textarea { min-height: 80px; }
 .tabla-caja { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; background: var(--papel); border-radius: var(--radio); overflow: hidden; }
 th, td { text-align: left; padding: .55rem .7rem; border-bottom: 1px solid var(--linea); vertical-align: top; }
-th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--tinta-suave); background: #f1eadd; }
+th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--tinta-suave); background: #eef1f6; }
 td input[type=text] { min-height: 40px; }
 
 /* Hoja de produccion */
@@ -151,7 +156,7 @@ table.registro-bpm td { font-size: .92rem; }
 .velo { position: fixed; inset: 0; background: #2b211acc; z-index: 20; display: grid; place-items: end center; padding: 0; }
 .modal { position: relative; background: var(--papel); width: 100%; max-width: 560px; max-height: 92vh; overflow: auto; border-radius: 20px 20px 0 0; padding: 1.2rem 1.1rem calc(1.2rem + env(safe-area-inset-bottom)); }
 .modal h2 { margin-top: 0; font-size: 1.25rem; padding-right: 2.6rem; }
-.cerrar-modal { position: absolute; top: .6rem; right: .6rem; width: 44px; height: 44px; border: 0; border-radius: 99px; background: #ece6db; color: var(--tinta); font-size: 1.6rem; line-height: 1; cursor: pointer; }
+.cerrar-modal { position: absolute; top: .6rem; right: .6rem; width: 44px; height: 44px; border: 0; border-radius: 99px; background: var(--gris-claro); color: var(--tinta); font-size: 1.6rem; line-height: 1; cursor: pointer; }
 .cerrar-modal:hover, .cerrar-modal:focus-visible { background: var(--linea); outline: none; }
 .modal .boton { width: 100%; margin-top: .6rem; }
 @media (min-width: 640px) { .velo { place-items: center; padding: 1rem; } .modal { border-radius: 20px; } }
@@ -290,21 +295,30 @@ table.registro-bpm td { font-size: .92rem; }
 
 /* Producción en curso: el nombre del pan resalta; los ingredientes van discretos debajo */
 .nombre-en-curso { font-size: 1.45rem; font-weight: 800; line-height: 1.2; }
-.vista-ingredientes { margin-top: .7rem; border-top: 1px solid #ece5d8; padding-top: .4rem;
+.vista-ingredientes { margin-top: .7rem; border-top: 1px solid var(--linea); padding-top: .4rem;
   display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); column-gap: 1.4rem; }
 .vista-ingredientes .fila-ing { display: flex; justify-content: space-between; align-items: center; gap: .6rem;
   padding: .12rem 0; font-size: .78rem; color: var(--tinta-suave); }
 .vista-ingredientes .nombre-ing { font-weight: 400; }
-.vista-ingredientes .chip-lote { margin: 0 0 0 .3rem; padding: .05rem .4rem; font-size: .75rem; font-weight: 600; background: #f3ede2; color: var(--tinta-suave); }
+.vista-ingredientes .chip-lote { margin: 0 0 0 .3rem; padding: .05rem .4rem; font-size: .75rem; font-weight: 600; background: var(--gris-claro); color: var(--tinta-suave); }
 .vista-ingredientes .sin-lote { color: #b3261e; font-size: .75rem; }
 .vista-ingredientes .fila-ing.falta { background: none; }
 @media (max-width: 600px) { .nombre-en-curso { font-size: 1.3rem; } }
 
 /* Etiquetas: línea que separa los días cuando se ve más de un día */
-tr.otro-dia td { border-top: 2px solid var(--trigo, #d9b77e); }
+tr.otro-dia td { border-top: 2px solid var(--acento); }
 
 /* Hojas de producción: el nombre del pan resalta sobre el resto */
 .nombre-hoja { font-size: 1.25rem; font-weight: 800; line-height: 1.2; }
 .lote-hoja { font-size: .95rem; color: var(--tinta-suave); margin-top: .1rem; }
 .mosaico-mix b { font-size: 1.1rem; }
 .mosaico-mix small { font-size: .74rem; line-height: 1.35; opacity: .8; }
+.volver .flecha-volver { font-size: 1.35rem; line-height: 1; }
+
+/* Botón de volver también como <button> (pantalla de inicio) */
+button.volver { border: 0; font-family: inherit; cursor: pointer; }
+
+/* Cocina, "En uso": borde de color según la caducidad del recipiente (o de la mezcla) */
+.tarjeta.tarjeta-sem.borde-rojo { border-left: 8px solid #d0342c; }
+.tarjeta.tarjeta-sem.borde-amarillo { border-left: 8px solid #e6a700; }
+.tarjeta.tarjeta-sem.borde-verde { border-left: 8px solid #2c9a57; }

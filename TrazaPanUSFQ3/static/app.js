@@ -115,7 +115,13 @@ function semaforo(l) {
 // disponible: lo que queda en ese lugar (se propone darlo todo de baja); en cocina la cantidad es opcional.
 async function darDeBaja(l, lugar, disponible) {
   const u = l.unidad || 'unidades';
-  const motivo = segmento([['CADUCADO', 'Caducado'], ['CONTAMINADO', 'Contaminado']], l.semaforo === 'rojo' ? 'CADUCADO' : '');
+  // En bodega secundaria también: "Registrado por error" (el lote no llegó; vuelve a bodega principal).
+  const opciones = [['CADUCADO', 'Caducado'], ['CONTAMINADO', 'Contaminado']].concat(lugar === 'secundaria' ? [['ERROR', 'Registrado por error']] : []);
+  let bloqueCantidad = null, notaError = null;
+  const motivo = segmento(opciones, l.semaforo === 'rojo' ? 'CADUCADO' : '', (v) => {
+    if (bloqueCantidad) bloqueCantidad.hidden = v === 'ERROR';
+    if (notaError) notaError.hidden = v !== 'ERROR';
+  });
   const cantidad = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: disponible != null ? num(Math.max(disponible, 0)) : '',
     placeholder: lugar === 'cocina' ? 'Opcional' : 'Solo números',
     oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; } });
@@ -124,12 +130,19 @@ async function darDeBaja(l, lugar, disponible) {
   const d = await modal('Dar de baja', h('div', null,
     h('p', { style: 'margin-top:0' }, h('b', null, l.ingrediente), ' | ', h('b', { class: 'mono' }, l.lote), ' ', semaforo(l)),
     h('label', null, 'Motivo'), motivo.el,
-    h('label', null, '¿Cuántas ' + u + ' se sacan de ' + nombres[lugar] + '?'), cantidad,
-    disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + num(Math.max(disponible, 0)) + ' ' + u + '.') : null,
-    h('label', null, 'Comentario'), comentario),
+    notaError = h('p', { class: 'nota', hidden: true }, 'El lote sale de bodega secundaria y vuelve a quedar en bodega principal, como si nunca hubiera pasado.'),
+    bloqueCantidad = h('div', null,
+      h('label', null, '¿Cuántas ' + u + ' se sacan de ' + nombres[lugar] + '?'), cantidad,
+      disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + num(Math.max(disponible, 0)) + ' ' + u + '.') : null,
+      h('label', null, 'Comentario'), comentario)),
   [{ texto: 'Dar de baja', clase: 'peligro-lleno', valor: () => ({ lote_id: l.id, lugar, motivo: motivo.valor, cantidad: cantidad.value.trim(), comentario: comentario.value.trim() }) },
     { texto: 'Cancelar', valor: null }]);
   if (!d) return false;
+  if (d.motivo === 'ERROR') {
+    await api('/secundaria/devolver', { lote_id: l.id });
+    avisar('Ingreso del lote ' + l.lote + ' anulado: vuelve a bodega principal', 'bien');
+    return true;
+  }
   const r = await api('/bajas', d);
   avisar('Lote ' + l.lote + ' dado de baja' + (r.vacio ? '' : ' (parcial)'), 'bien');
   return true;
@@ -203,19 +216,42 @@ const nombreRecipiente = (g) => (g.n_recipientes === 0 ? 'empaque' : g.n_recipie
 const listaLotes = (lotes) => lotes.map((l) => l.lote).join(', ');
 
 // Despues de poner un lote nuevo: ¿lo anterior sigue ahi (se mezclo) o el recipiente estaba vacio?
-async function preguntarAnteriores(grupos) {
+function preguntaSeAcabo(g, cancelable) {
+  const empaque = g.n_recipientes === 0;
+  const cosa = empaque ? 'empaque' : 'recipiente';
+  const cual = g.n_recipientes > 1 ? 'El recipiente ' + g.recipiente + ' de ' + g.ingrediente : 'El ' + cosa + ' anterior de ' + g.ingrediente;
+  return modal('¿' + cual + ' se acabó?',
+    h('div', null, h('p', null, 'Lote anterior: ', h('b', { class: 'mono' }, listaLotes(g.anteriores))),
+      h('p', { class: 'suave' }, 'Lote nuevo: ', h('b', { class: 'mono' }, listaLotes(g.nuevos)))),
+    [{ texto: 'Sí, empezamos con un ' + cosa + ' nuevo', clase: 'principal', valor: 'vacio' },
+      { texto: empaque ? 'No, seguimos usando los dos lotes' : 'No, mezclamos ambos lotes', valor: 'mezcla' }], !cancelable);
+}
+
+// Antes de registrar en cocina: pregunta por lo que ya estaba en cada recipiente. null = se canceló con la X (no se guarda nada).
+async function preguntarAntesDeAbrir(ing, items, lotes) {
+  const { grupos } = await api('/cocina/recipientes');
+  const decisiones = [];
+  const porRecipiente = new Map();
+  items.forEach((it) => { const r = it.recipiente || 1; porRecipiente.set(r, (porRecipiente.get(r) || []).concat(it.lote_id)); });
+  for (const [recipiente, ids] of porRecipiente) {
+    const g = grupos.find((x) => x.ingrediente_id === ing.id && x.recipiente === recipiente);
+    if (!g) continue;
+    const yaAbiertos = new Set(g.lotes.map((l) => l.id));
+    const nuevos = lotes.filter((l) => ids.includes(l.id) && !yaAbiertos.has(l.id));
+    const anteriores = g.lotes.filter((l) => !ids.includes(l.id));
+    if (!nuevos.length || !anteriores.length) continue;
+    const r = await preguntaSeAcabo(Object.assign({}, g, { anteriores, nuevos }), true);
+    if (!r) return null;
+    decisiones.push({ recipiente, respuesta: r, anteriores });
+  }
+  return decisiones;
+}
+
+async function preguntarAnteriores(grupos, yaRespondidos) {
   for (const g of grupos || []) {
-    const ing = g.ingrediente;
-    let quedan = g.lotes.length;
-    if (g.anteriores.length) {
-      const empaque = g.n_recipientes === 0;
-      const cosa = empaque ? 'empaque' : 'recipiente';
-      const cual = g.n_recipientes > 1 ? 'El recipiente ' + g.recipiente + ' de ' + ing : 'El ' + cosa + ' anterior de ' + ing;
-      const r = await modal('¿' + cual + ' se acabó?',
-      h('div', null, h('p', null, 'Lote anterior: ', h('b', { class: 'mono' }, listaLotes(g.anteriores))),
-        h('p', { class: 'suave' }, 'Lote nuevo: ', h('b', { class: 'mono' }, listaLotes(g.nuevos)))),
-      [{ texto: 'Sí, empezamos con un ' + cosa + ' nuevo', clase: 'principal', valor: 'vacio' },
-        { texto: empaque ? 'No, seguimos usando los dos lotes' : 'No, mezclamos ambos lotes', valor: 'mezcla' }], true);
+    let quedan = yaRespondidos && yaRespondidos.has(g.recipiente) ? g.nuevos.length : g.lotes.length;
+    if (g.anteriores.length && !yaRespondidos) {
+      const r = await preguntaSeAcabo(g, false);
       if (r === 'vacio') {
         await intentar(() => api('/cocina/vaciar', { ingrediente_id: g.ingrediente_id, recipiente: g.recipiente, lote_ids: g.anteriores.map((l) => l.id) }));
         quedan = g.nuevos.length;
@@ -343,7 +379,7 @@ async function loteManual(ing, destino) {
 }
 
 function encabezado(titulo, subtitulo) {
-  return [h('a', { class: 'volver no-imprimir', href: '#/' }, '← Inicio'), h('h1', null, titulo),
+  return [h('a', { class: 'volver no-imprimir', href: '#/' }, h('span', { class: 'flecha-volver', 'aria-hidden': 'true' }, '←'), 'Volver al inicio'), h('h1', null, titulo),
     subtitulo ? h('p', { class: 'suave' }, subtitulo) : null];
 }
 // Pone en cada celda el titulo de su columna, para mostrar las tablas como fichas en el celular.
@@ -383,6 +419,11 @@ function fijarArea(a) {
   pintarArea();
 }
 const $area = h('button', { class: 'chip-persona', type: 'button', onclick: () => cambiarArea() });
+// Botón de volver en la pantalla del área: regresa a elegir el área.
+function botonCambiarArea() {
+  return h('button', { class: 'volver', type: 'button', onclick: () => cambiarArea() },
+    h('span', { class: 'flecha-volver', 'aria-hidden': 'true' }, '←'), 'Cambiar de área');
+}
 // Cambiar de área: si hay contraseñas, se cierra la sesión para que la otra área escriba la suya.
 async function cambiarArea() {
   if (sesion.requiere) { try { await fetch('/api/salir', { method: 'POST' }); } catch (e) { /* sin conexión */ } sesion.area = null; }
@@ -469,11 +510,11 @@ async function vistaInicio() {
   const a = AREAS[area()];
   pintar(
     h('div', { class: 'nombre-app nombre-inicio' }, 'Traza', h('b', null, 'Pan'), 'USFQ'),
+    botonCambiarArea(),
     h('h1', null, 'Hola' + (quien() ? ', ' + quien().split(' ')[0] : '')),
     h('p', { class: 'suave' }, 'Área: ', h('b', null, a.nombre)),
     AREAS_CON_AVISOS.includes(area()) ? h('div', { id: 'avisos-inicio' }) : null,
-    h('div', { class: 'mosaicos' }, a.secciones.map((sec) => SECCIONES[sec]())),
-    h('div', { class: 'fila-botones' }, h('button', { class: 'boton chico', type: 'button', onclick: () => cambiarArea() }, 'Cambiar de área')));
+    h('div', { class: 'mosaicos' }, a.secciones.map((sec) => SECCIONES[sec]())));
   const caja = document.getElementById('avisos-inicio');
   if (caja) { pintarAvisosInicio(caja); revisarAvisos(); }
 }
@@ -863,7 +904,7 @@ async function vistaSalidas(pestana) {
         h('label', null, '¿Cuántas ' + u + '?' + (l.disponible != null ? ' (quedan ' + num(l.disponible) + ')' : '')), cantidad,
         h('div', { class: 'fila-botones' }, h('button', { class: 'boton ok', type: 'button', onclick: () => registrarPaso(l) }, 'Registrar')));
     };
-    return [h('a', { class: 'volver', href: '#/salidas', onclick: (e) => { e.preventDefault(); productoSel = null; loteSel = null; dibujar(); } }, '← Elegir otro producto'),
+    return [h('a', { class: 'volver', href: '#/salidas', onclick: (e) => { e.preventDefault(); productoSel = null; loteSel = null; dibujar(); } }, [h('span', { class: 'flecha-volver', 'aria-hidden': 'true' }, '←'), 'Elegir otro producto']),
       h('h2', { class: 'titulo-con-foto', style: 'margin-top:.2rem' }, fotoProducto(fotoDe(productoSel), productoSel), productoSel),
       h('p', { class: 'suave' }, '¿Qué lote?'),
       lotes.map((l) => [
@@ -909,14 +950,6 @@ async function vistaSecundaria(pestana) {
   // Semáforo de lo que hay en bodega secundaria: arriba lo caducado y lo que caduca antes.
   const cajaSec = h('div', null);
   let filtro = '';
-  const cambiar = (l) => intentar(async () => {
-    const r = await modal(l.ingrediente + ' · ' + l.lote, h('p', null, '¿Qué pasó con este lote?'),
-      [{ texto: 'Ya no queda nada de este lote (agotado)', clase: 'principal', valor: 'agotar' },
-        { texto: 'Lo registré por error: no llegó', valor: 'devolver' }, { texto: 'Cancelar', valor: null }]);
-    if (r === 'agotar') await api('/lotes/agotar', { lote_id: l.id });
-    if (r === 'devolver') await api('/secundaria/devolver', { lote_id: l.id });
-    if (r) vistaSecundaria('semaforo');
-  });
   const pintarSec = () => {
     const n = normal(filtro);
     const visibles = enBodega.filter((l) => !n || normal([l.ingrediente, l.producto_bodega, l.lote, l.proveedor].join(' ')).includes(n));
@@ -924,7 +957,6 @@ async function vistaSecundaria(pestana) {
       enBodega.length ? leyendaSemaforo(enBodega) : null,
       enBodega.length > 6 ? buscadorLotes(cajaSec, filtro, (v) => { filtro = v; pintarSec(); }) : null,
       enBodega.length ? (visibles.length ? visibles.map((l) => tarjetaSemaforo(l, l.ingrediente, l.disponible_cocina, [
-        h('button', { class: 'boton chico', type: 'button', onclick: () => cambiar(l) }, 'Cambiar'),
         h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
           if (await darDeBaja(l, 'secundaria', l.disponible_cocina)) vistaSecundaria('semaforo'); }) }, 'Dar de baja')],
         (ings.find((i) => i.id === l.ingrediente_id) || {}).foto || null))
@@ -968,7 +1000,7 @@ async function elegirIngreso(ing) {
   const dibujar = () => {
     const y = window.scrollY;
     const visibles = verTodos ? lotes : lotes.slice(0, 8);
-    pintar(h('a', { class: 'volver', href: '#/secundaria', onclick: (e) => { e.preventDefault(); vistaSecundaria(); } }, '← Bodega secundaria'),
+    pintar(h('a', { class: 'volver', href: '#/secundaria', onclick: (e) => { e.preventDefault(); vistaSecundaria(); } }, [h('span', { class: 'flecha-volver', 'aria-hidden': 'true' }, '←'), 'Volver a Bodega secundaria']),
       h('h1', null, ing.nombre),
       h('p', { class: 'suave' }, 'Toca el lote que llegó (compara con el empaque) y escribe cuánto de ese lote pasó a bodega secundaria.'),
       visibles.length ? visibles.map((l) => [
@@ -1000,7 +1032,26 @@ async function elegirIngreso(ing) {
 }
 
 // ------------------------------------------------------------------ cocina
-async function vistaCocina() {
+// Recipiente con lotes mezclados: toda la mezcla caduca con el lote que caduca primero (si uno está caducado, todo lo está).
+const esMezcla = (g) => g.n_recipientes !== 0 && g.tipo !== 'interno' && g.lotes.length > 1;
+function estadoMezcla(g) {
+  const conFecha = g.lotes.filter((l) => l.semaforo);
+  return conFecha.length ? ordenarSemaforo(conFecha)[0] : {};
+}
+// Semáforo de cocina: un renglón por recipiente mezclado y uno por cada lote que está solo (o en su propio empaque).
+function unidadesSemaforoCocina(grupos) {
+  const salida = [];
+  for (const g of grupos) {
+    if (esMezcla(g)) {
+      const peor = estadoMezcla(g);
+      salida.push({ g, lotes: g.lotes, semaforo: peor.semaforo, caducidad: peor.caducidad, dias_caducidad: peor.dias_caducidad, peor, ingrediente: g.ingrediente });
+    } else g.lotes.forEach((l) => salida.push({ g, lotes: [l], semaforo: l.semaforo, caducidad: l.caducidad, dias_caducidad: l.dias_caducidad, ingrediente: g.ingrediente }));
+  }
+  return ordenarSemaforo(salida);
+}
+
+async function vistaCocina(pestana) {
+  pestana = pestana === 'semaforo' ? 'semaforo' : 'cocina';
   const [ings, rec] = await Promise.all([api('/ingredientes'), api('/cocina/recipientes')]);
   const usables = ings.filter((i) => i.tipo !== 'no_aplica');
   // Subreceta (relleno, glacé, masa madre): sigue en uso (guardada en el refrigerador) hasta que se acaba o se hace una nueva.
@@ -1009,11 +1060,15 @@ async function vistaCocina() {
     await api('/cocina/vaciar', { ingrediente_id: g.ingrediente_id, recipiente: g.recipiente, lote_ids: [l.id], terminado: true });
     avisar('Lote cerrado', 'bien'); vistaCocina();
   });
-  const tarjetaRecipiente = (g) => h('div', { class: 'tarjeta' },
+  const estadoGrupo = (g) => (esMezcla(g) ? estadoMezcla(g) : ordenarSemaforo(g.lotes.filter((l) => l.semaforo))[0] || {});
+  const tarjetaRecipiente = (g) => h('div', { class: 'tarjeta tarjeta-sem borde-' + (estadoGrupo(g).semaforo || 'sin') },
     h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem;align-items:center;flex-wrap:wrap' },
       h('div', null, h('b', null, g.ingrediente), ' ', g.tipo === 'interno' ? null : h('span', { class: 'etq gris' },
         g.n_recipientes === 0 ? 'en su empaque' : g.n_recipientes > 1 ? 'Recipiente ' + g.recipiente : 'Recipiente'),
-      g.n_recipientes !== 0 && g.lotes.length > 1 ? [' ', h('span', { class: 'etq ' + (g.exceso ? 'rojo' : 'aviso') }, g.lotes.length + ' lotes mezclados')] : null)),
+      g.n_recipientes !== 0 && g.lotes.length > 1 ? [' ', h('span', { class: 'etq ' + (g.exceso ? 'rojo' : 'aviso') }, g.lotes.length + ' lotes mezclados')] : null,
+      esMezcla(g) && estadoMezcla(g).semaforo ? h('div', { class: 'chico', style: 'margin-top:.3rem' }, 'Toda la mezcla: ', semaforo(estadoMezcla(g))) : null),
+      esMezcla(g) ? h('button', { class: 'boton chico peligro', type: 'button',
+        onclick: () => bajaRecipiente({ g, lotes: g.lotes, ingrediente: g.ingrediente, semaforo: estadoMezcla(g).semaforo }) }, 'Dar de baja todo') : null),
     g.exceso ? h('div', { class: 'nota rojo' }, 'Más de ' + rec.maximo + ' lotes mezclados: conviene vaciar y limpiar este recipiente antes de poner el siguiente lote.') : null,
     g.lotes.map((l) => h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem;align-items:center;margin-top:.45rem' },
       h('div', null, h('span', { class: 'chip-lote' }, l.lote), l.origen === 'manual' ? h('span', { class: 'etq rojo' }, 'a mano') : null,
@@ -1027,16 +1082,34 @@ async function vistaCocina() {
   // desde que se empieza su producción hasta que se termina, se da de baja o se reemplaza por una nueva tanda.
   const deBodega = usables.filter((i) => i.tipo !== 'interno');
   const enUso = (i) => i.n_abiertos ? h('span', { class: 'num verde' }, i.n_abiertos + ' en uso') : null;
+  const fotoDe = (id) => (ings.find((i) => i.id === id) || {}).foto || null;
+  const unidades = unidadesSemaforoCocina(rec.grupos);
+  const bajaRecipiente = (u) => intentar(async () => {
+    const motivo = segmento([['CADUCADO', 'Caducado'], ['CONTAMINADO', 'Contaminado']], u.semaforo === 'rojo' ? 'CADUCADO' : '');
+    const comentario = h('input', { type: 'text', placeholder: 'Qué pasó (opcional)' });
+    const d = await modal('Dar de baja todo el recipiente', h('div', null,
+      h('p', { style: 'margin-top:0' }, h('b', null, u.ingrediente), ' | ', h('b', { class: 'mono' }, listaLotes(u.lotes))),
+      h('p', { class: 'chico suave' }, 'Están mezclados: se dan de baja los ' + u.lotes.length + ' lotes y dejan de anotarse en los panes.'),
+      h('label', null, 'Motivo'), motivo.el, h('label', null, 'Comentario'), comentario),
+    [{ texto: 'Dar de baja los ' + u.lotes.length + ' lotes', clase: 'peligro-lleno', valor: () => ({ motivo: motivo.valor, comentario: comentario.value.trim() }) },
+      { texto: 'Cancelar', valor: null }]);
+    if (!d) return;
+    if (!d.motivo) throw new Error('Elige el motivo.');
+    for (const l of u.lotes) await api('/bajas', { lote_id: l.id, lugar: 'cocina', motivo: d.motivo, cantidad: '', comentario: d.comentario });
+    avisar('Recipiente dado de baja', 'bien'); vistaCocina();
+  });
+  const ordenGrupos = [...rec.grupos].sort((a, b) => (ORDEN_SEM[estadoGrupo(a).semaforo] ?? 3) - (ORDEN_SEM[estadoGrupo(b).semaforo] ?? 3)
+    || String(estadoGrupo(a).caducidad || '9999').localeCompare(String(estadoGrupo(b).caducidad || '9999')) || a.ingrediente.localeCompare(b.ingrediente));
   pintar(encabezado('Cocina', 'Antes de abrir un empaque nuevo, regístralo aquí. Lo que está abierto es lo que se anota en las hojas.'),
     h('h2', null, 'Abrir un lote: ¿de qué ingrediente?'),
     h('div', { class: 'rejilla' }, deBodega.map((i) => h('button', { class: 'mosaico con-foto foto-chica' + (i.n_secundaria ? '' : ' vacio'), type: 'button',
       onclick: () => intentar(() => elegirApertura(i)) },
-    enUso(i), fotoProducto(i.foto, i.nombre), h('b', null, i.nombre), h('small', null, i.n_secundaria ? i.n_secundaria + ' lote(s) en bodega secundaria' : 'Nada en bodega secundaria')))),
+    enUso(i), fotoProducto(i.foto, i.nombre), h('b', null, i.nombre)))),
     h('h2', null, 'En uso ahora en cocina ', h('span', { class: 'num verde' }, rec.grupos.reduce((n, g) => n + g.lotes.length, 0))),
     h('p', { class: 'chico suave' }, 'Estos lotes se anotan en cada pan que se empiece. Cuando pongas un lote nuevo, la app pregunta si el anterior se acabó.'),
     rec.grupos.some((g) => g.lotes.some((l) => l.semaforo === 'rojo'))
       ? h('div', { class: 'nota rojo' }, 'Hay un lote caducado en uso: dalo de baja. Mientras siga abierto, no se pueden empezar los panes que lo llevan.') : null,
-    rec.grupos.length ? rec.grupos.map(tarjetaRecipiente) : h('p', { class: 'suave' }, 'No hay ningún lote en uso.'));
+    rec.grupos.length ? [leyendaSemaforo(unidades), ordenGrupos.map(tarjetaRecipiente)] : h('p', { class: 'suave' }, 'No hay ningún lote en uso.'));
 }
 
 async function elegirApertura(ing) {
@@ -1067,7 +1140,7 @@ async function elegirApertura(ing) {
   };
   const dibujar = () => {
     const y = window.scrollY;
-    pintar(h('a', { class: 'volver', href: '#/cocina', onclick: (e) => { e.preventDefault(); vistaCocina(); } }, '← Cocina'),
+    pintar(h('a', { class: 'volver', href: '#/cocina', onclick: (e) => { e.preventDefault(); vistaCocina(); } }, [h('span', { class: 'flecha-volver', 'aria-hidden': 'true' }, '←'), 'Volver a Cocina']),
       h('h1', null, ing.nombre),
       h('p', { class: 'suave' }, ing.tipo === 'interno' ? 'Lotes guardados de esta subreceta. Toca el que vas a usar.'
           : 'Toca el lote que tomas de bodega secundaria y escribe cuánto.'),
@@ -1093,9 +1166,17 @@ async function elegirApertura(ing) {
         onclick: () => intentar(async () => {
           if (nRec > 1 && ing.tipo !== 'interno' && [...elegidos.values()].some((e) => !e.recipiente)) throw new Error('Elige en qué recipiente pones cada lote.');
           const items = [...elegidos].map(([lote_id, e]) => ({ lote_id, cantidad: e.cantidad, recipiente: e.recipiente || 1 }));
+          for (const it of items) {
+            const c = Number(String(it.cantidad || '').replace(',', '.'));
+            if (conCantidad && !(c > 0)) throw new Error('Escribe cuánto tomas de cada lote (solo el número).');
+          }
+          const decisiones = await preguntarAntesDeAbrir(ing, items, lotes);
+          if (!decisiones) return;                       // X: no se registra nada
           const r = await api('/cocina/abrir', { items });
+          for (const d of decisiones.filter((x) => x.respuesta === 'vacio'))
+            await api('/cocina/vaciar', { ingrediente_id: ing.id, recipiente: d.recipiente, lote_ids: d.anteriores.map((l) => l.id) });
           avisar('Registrado en cocina', 'bien');
-          await preguntarAnteriores(r.anteriores); vistaCocina();
+          await preguntarAnteriores(r.anteriores, new Set(decisiones.filter((x) => x.respuesta === 'vacio').map((x) => x.recipiente))); vistaCocina();
         }) }, elegidos.size ? 'Registrar ' + elegidos.size + ' lote(s) en cocina' : 'Elige el lote que vas a usar'))));
     window.scrollTo(0, y);
     enfocar = null;
@@ -1110,6 +1191,7 @@ function tarjetaProduccion(p) {
       h('div', null, h('div', { class: 'nombre-hoja' }, p.producto), h('div', { class: 'mono lote-hoja' }, p.lote_final),
         h('div', { class: 'chico suave' }, 'Inició ' + hora(p.iniciado_en) + ' · ' + (p.iniciado_por || ''))),
       h('div', { style: 'text-align:right' }, h('span', { class: 'etq ' + CLASE_ESTADO[p.estado] }, NOMBRE_ESTADO[p.estado]),
+        p.estado === 'en_curso' && p.masa_lista_en ? h('div', null, h('span', { class: 'etq gris' }, 'Masa en reposo')) : null,
         p.faltantes ? h('div', null, h('span', { class: 'etq rojo' }, 'Faltan ' + p.faltantes + ' lote(s)')) : null)));
 }
 
@@ -1120,18 +1202,27 @@ async function vistaProduccion() {
   const hojas = await Promise.all(enCurso.map((p) => api('/producciones/' + p.id)));
   const ingredientesDe = (hoja) => h('div', { class: 'vista-ingredientes' }, hoja.lineas.map((li) => {
     const vigentes = li.lotes.filter((l) => !l.quitado_en);
-    return h('div', { class: 'fila-ing' + (li.falta_lote ? ' falta' : '') },
+    return h('div', { class: 'fila-ing' + (li.falta_lote && !li.despues_reposo ? ' falta' : '') },
       h('span', { class: 'nombre-ing' }, li.etiqueta),
       li.tipo === 'no_aplica' ? h('span', { class: 'suave' }, '—')
         : li.no_utilizado ? h('span', { class: 'suave' }, 'No se usó')
         : vigentes.length ? h('span', null, vigentes.map((l) => h('span', { class: 'chip-lote' }, l.lote)))
+        : li.despues_reposo ? h('span', { class: 'suave' }, 'Al terminar')
         : h('span', { class: 'sin-lote' }, 'Sin lote'));
   }));
+  const masaLista = (p) => intentar(async () => {
+    if (!await confirmar('Masa lista: ' + p.producto, 'La masa queda en reposo. Los lotes que se abran desde ahora ya no se anotan en esta masa' +
+      ' (solo lo que se pone al terminar, como el relleno). Mañana toca «Terminó».', 'Sí, masa lista')) return;
+    await api('/producciones/' + p.id + '/masa-lista', {});
+    avisar(p.producto + ': masa en reposo', 'bien'); vistaProduccion();
+  });
   const tarjetaEnCurso = (p, i) => h('div', { class: 'tarjeta' },
     h('div', { style: 'display:flex;justify-content:space-between;gap:.8rem;align-items:center;flex-wrap:wrap' },
       h('div', null, h('div', { class: 'nombre-en-curso' }, p.producto), h('div', { class: 'mono' }, p.lote_final),
-        h('div', { class: 'chico suave' }, 'Empezó ' + hora(p.iniciado_en) + ' · ' + (p.iniciado_por || ''))),
-      h('button', { class: 'boton ok', type: 'button', onclick: () => intentar(async () => {
+        h('div', { class: 'chico suave' }, 'Empezó ' + hora(p.iniciado_en) + ' · ' + (p.iniciado_por || '')),
+        p.masa_lista_en ? h('span', { class: 'etq aviso', style: 'margin-top:.3rem' }, 'En reposo desde ' + hora(p.masa_lista_en)) : null),
+      p.lleva_reposo && !p.masa_lista_en ? h('button', { class: 'boton principal', type: 'button', onclick: () => masaLista(p) }, 'Masa lista')
+      : h('button', { class: 'boton ok', type: 'button', onclick: () => intentar(async () => {
         if (!await confirmar('Terminó ' + p.producto, 'Producción ' + p.lote_final + '. El encargado completará la hoja.', 'Sí, terminó')) return;
         await api('/producciones/' + p.id + '/terminar', {});
         avisar('Listo: ' + p.producto + ' terminó', 'bien'); vistaProduccion();
@@ -1149,7 +1240,7 @@ async function vistaProduccion() {
     h('h2', null, 'Empezar producción de…'),
     // Un pan que ya está en producción no se puede empezar otra vez hasta que termine.
     h('div', { class: 'rejilla' }, productos.filter((p) => p.activo && !p.armado).map((p) => {
-      const enMarcha = enCurso.some((x) => x.producto_id === p.id);
+      const enMarcha = enCurso.some((x) => x.producto_id === p.id && !x.masa_lista_en);
       return h('button', { class: 'mosaico' + (p.lineas.length && !enMarcha ? '' : ' vacio'), disabled: enMarcha,
       type: 'button', onclick: (ev) => intentar(async () => {
         if (ev.currentTarget) ev.currentTarget.disabled = true;
@@ -1259,7 +1350,7 @@ async function vistaArmarMix(productoId) {
     window.scrollTo(0, y);
     enfocar = null;
   };
-  pintar(h('a', { class: 'volver', href: '#/hojas', onclick: (e) => { e.preventDefault(); vistaHojas(); } }, '← Hojas de producción'),
+  pintar(h('a', { class: 'volver', href: '#/hojas', onclick: (e) => { e.preventDefault(); vistaHojas(); } }, [h('span', { class: 'flecha-volver', 'aria-hidden': 'true' }, '←'), 'Volver a Hojas de producción']),
     h('h1', null, 'Armar ' + r.producto.nombre),
     h('p', { class: 'suave' }, 'Toca los lotes de pan que entran y escribe cuántas unidades de cada uno. Aparecen los panes que cocina terminó en los últimos ' + r.dias + ' días.'),
     contenido, venceTxt,
@@ -1700,15 +1791,23 @@ async function vistaAdmin(pestana) {
       const seccionReceta = h('div', null);
       const seccionMix = h('div', null, h('h3', null, 'Panes que forman la mezcla'), cajaComp,
         h('button', { class: 'boton chico', type: 'button', onclick: () => { componentes.push(null); dibujarComp(); } }, '+ pan'));
-      const alternar = () => { seccionMix.hidden = !arm.checked; seccionReceta.hidden = arm.checked; };
+      const alternar = () => { seccionMix.hidden = !arm.checked; seccionReceta.hidden = arm.checked; if (filaReposo) filaReposo.hidden = arm.checked; };
+      let filaReposo = null;
       const inactivo = h('input', { type: 'checkbox', checked: p.id && !p.activo });
-      let lineas = p.lineas.map((l) => ({ etiqueta: l.etiqueta, ingrediente_id: l.ingrediente_id }));
+      let lineas = p.lineas.map((l) => ({ etiqueta: l.etiqueta, ingrediente_id: l.ingrediente_id, despues_reposo: !!l.despues_reposo }));
+      // Pan con reposo: la masa se hace un día y se termina al siguiente. Al marcarlo, las subrecetas (relleno…) quedan como «al terminar».
+      const tipoDe = (id) => (ings.find((i) => i.id === id) || {}).tipo;
+      const reposo = h('input', { type: 'checkbox', checked: !!p.lleva_reposo, onchange: () => {
+        if (reposo.checked && !lineas.some((l) => l.despues_reposo)) lineas.forEach((l) => { l.despues_reposo = tipoDe(l.ingrediente_id) === 'interno'; });
+        dibujarLineas(); } });
       const caja = h('div', null);
       const dibujarLineas = () => caja.replaceChildren(...lineas.map((l, i) => {
         const sel = selectorIngrediente(l.ingrediente_id);
         sel.addEventListener('change', () => { l.ingrediente_id = Number(sel.value) || null; });
         const et = h('input', { type: 'text', value: l.etiqueta, placeholder: 'Nombre en la hoja (opcional)', oninput: (e) => { l.etiqueta = e.target.value; } });
-        return h('div', { class: 'en-linea', style: 'margin:.4rem 0' }, sel, et,
+        const despues = reposo.checked ? h('label', { class: 'chico', style: 'display:flex;gap:.35rem;align-items:center;font-weight:400;margin:0;white-space:nowrap' },
+          h('input', { type: 'checkbox', checked: !!l.despues_reposo, onchange: (e) => { l.despues_reposo = e.target.checked; } }), 'Se pone al terminar') : null;
+        return h('div', { class: 'en-linea', style: 'margin:.4rem 0' }, sel, et, despues,
           h('button', { class: 'boton chico', type: 'button', disabled: i === 0, onclick: () => { [lineas[i - 1], lineas[i]] = [lineas[i], lineas[i - 1]]; dibujarLineas(); } }, '↑'),
           h('button', { class: 'boton chico peligro', type: 'button', onclick: () => { lineas.splice(i, 1); dibujarLineas(); } }, 'Quitar'));
       }));
@@ -1716,27 +1815,30 @@ async function vistaAdmin(pestana) {
       dibujarComp();
       llenar(seccionReceta, h('h3', null, 'Ingredientes, en el orden de la hoja'), caja,
         h('button', { class: 'boton chico', type: 'button', onclick: () => { lineas.push({ etiqueta: '', ingrediente_id: null }); dibujarLineas(); } }, '+ ingrediente'));
-      alternar(); alternarVida();
+      alternarVida();
       poner(h('button', { class: 'boton chico', type: 'button', onclick: recargar }, '← Todas las recetas'),
         h('div', { class: 'tarjeta' }, h('div', { class: 'en-linea' },
           h('div', null, h('label', null, 'Producto'), nombre), h('div', null, h('label', null, 'Código del lote'), codigo),
           cajaMeses, cajaDias),
         h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' }, sub, 'Es una subreceta: su lote se usa como ingrediente de otros panes'),
         h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' }, arm, 'Es un Mix Bread: se arma con panes ya producidos (sin receta)'),
+        filaReposo = h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' }, reposo,
+          'Lleva reposo: la masa se hace un día y se termina al siguiente (aparece el botón «Masa lista»)'),
         p.id ? h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' }, inactivo, 'Ya no se produce (ocultar)') : null,
         seccionMix, seccionReceta,
         h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: () => intentar(async () => {
           await api('/productos', { id: p.id, nombre: nombre.value, codigo: codigo.value, vida_util_meses: meses.value, vida_util_dias: dias.value, es_subreceta: sub.checked,
-            inactivo: inactivo.checked, lineas, armado: arm.checked, componentes: componentes.filter(Boolean) });
+            inactivo: inactivo.checked, lineas, armado: arm.checked, componentes: componentes.filter(Boolean), lleva_reposo: reposo.checked && !sub.checked });
           avisar('Receta guardada', 'bien'); recargar();
         }) }, 'Guardar receta'))));
+      alternar();
     };
     poner(h('p', { class: 'suave' }, 'La receta decide qué renglones tiene la hoja y qué lotes se anotan solos. Los cambios valen para las producciones nuevas.'),
       h('button', { class: 'boton chico', type: 'button', onclick: () => editar(null) }, '+ Producto nuevo'),
       productos.map((p) => h('div', { class: 'tarjeta', style: p.activo ? '' : 'opacity:.55' },
         h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem' },
           h('div', null, h('b', null, p.nombre), ' ', h('span', { class: 'etq gris mono' }, p.codigo), p.produce ? h('span', { class: 'etq aviso' }, 'subreceta') : null,
-            p.armado ? h('span', { class: 'etq verde' }, 'Mix Bread') : null,
+            p.armado ? h('span', { class: 'etq verde' }, 'Mix Bread') : null, p.lleva_reposo ? h('span', { class: 'etq gris' }, 'con reposo') : null,
             h('div', { class: 'chico suave' }, p.armado ? 'Panes: ' + (p.componentes.map((c) => c.nombre).join(' · ') || 'sin definir')
               : p.lineas.length ? p.lineas.map((l) => l.etiqueta).join(' · ') : 'Sin receta: no se puede iniciar su producción.')),
           h('button', { class: 'boton chico', type: 'button', onclick: () => editar(p) }, 'Editar')))));
@@ -1816,11 +1918,11 @@ function vistaClave() {
   });
   clave.addEventListener('keydown', (e) => { if (e.key === 'Enter') entrar(); });
   pintar(h('div', { class: 'nombre-app nombre-inicio' }, 'Traza', h('b', null, 'Pan'), 'USFQ'),
+    botonCambiarArea(),
     h('h1', null, a.nombre),
     h('div', { class: 'tarjeta', style: 'max-width:420px' },
       h('label', { style: 'margin-top:0' }, 'Contraseña de ' + a.nombre), clave,
-      h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: entrar }, 'Entrar'))),
-    h('div', { class: 'fila-botones' }, h('button', { class: 'boton chico', type: 'button', onclick: () => cambiarArea() }, 'Cambiar de área')));
+      h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: entrar }, 'Entrar'))));
   setTimeout(() => clave.focus(), 50);
 }
 
@@ -1829,7 +1931,7 @@ async function navegar() {
   document.querySelectorAll('.velo').forEach((v) => v.remove());
   paginaHorizontal(false);
   $vista.classList.remove('ancho');
-  const rutas = { '': vistaInicio, bodega: vistaBodega, salidas: () => vistaSalidas(partes[1]), secundaria: () => vistaSecundaria(partes[1]), cocina: vistaCocina, produccion: vistaProduccion, hojas: vistaHojas,
+  const rutas = { '': vistaInicio, bodega: vistaBodega, salidas: () => vistaSalidas(partes[1]), secundaria: () => vistaSecundaria(partes[1]), cocina: () => vistaCocina(partes[1]), produccion: vistaProduccion, hojas: vistaHojas,
     hoja: () => vistaHoja(Number(partes[1])), etiquetas: () => vistaEtiquetas(), consulta: vistaConsulta, admin: () => vistaAdmin(partes[1]) };
   const vista = rutas[partes[0]] || vistaInicio;
   if (!area()) { vistaInicio(); return; }

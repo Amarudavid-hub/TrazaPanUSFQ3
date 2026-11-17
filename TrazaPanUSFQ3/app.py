@@ -312,6 +312,19 @@ COLUMNAS_RECEPCION = [
 
 
 def migrar(con):
+    # Version 19: panes con reposo (la masa se hace un dia y se termina al siguiente).
+    #   productos.lleva_reposo: muestra el boton "Masa lista"; receta.despues_reposo: renglon que se agrega al dia
+    #   siguiente (por ejemplo el relleno); producciones.masa_lista_en: desde ahi la masa ya no recibe lotes nuevos.
+    if "lleva_reposo" not in {f["name"] for f in con.execute("PRAGMA table_info(productos)")}:
+        con.execute("ALTER TABLE productos ADD COLUMN lleva_reposo INTEGER DEFAULT 0")
+    if "despues_reposo" not in {f["name"] for f in con.execute("PRAGMA table_info(receta)")}:
+        con.execute("ALTER TABLE receta ADD COLUMN despues_reposo INTEGER DEFAULT 0")
+    if "despues_reposo" not in {f["name"] for f in con.execute("PRAGMA table_info(produccion_lineas)")}:
+        con.execute("ALTER TABLE produccion_lineas ADD COLUMN despues_reposo INTEGER DEFAULT 0")
+    columnas_r = {f["name"] for f in con.execute("PRAGMA table_info(producciones)")}
+    if "masa_lista_en" not in columnas_r:
+        con.execute("ALTER TABLE producciones ADD COLUMN masa_lista_en TEXT")
+        con.execute("ALTER TABLE producciones ADD COLUMN masa_lista_por TEXT")
     existentes = {f["name"] for f in con.execute("PRAGMA table_info(recepciones)")}
     for nombre, tipo in COLUMNAS_RECEPCION:
         if nombre not in existentes:
@@ -435,6 +448,10 @@ def agregar_al_catalogo(con, nombre):
 
 def sembrar_mezclas(con):
     """Ajustes iniciales que necesitan los productos e ingredientes ya cargados (se hacen una sola vez)."""
+    if not con.execute("SELECT 1 FROM meta WHERE clave='v19_reposo'").fetchone():
+        # La ciabatta reposa toda la noche: se marca con reposo (los demas se marcan en Administrar → Recetas).
+        con.execute("UPDATE productos SET lleva_reposo=1 WHERE nombre LIKE 'CIABATTA%'")
+        con.execute("INSERT INTO meta(clave,valor) VALUES('v19_reposo',?)", (ahora(),))
     if not con.execute("SELECT 1 FROM meta WHERE clave='v9_catalogo'").fetchone():
         for nombre in CATALOGO_BODEGA:
             alias_id = agregar_al_catalogo(con, nombre)
@@ -2032,8 +2049,8 @@ def api_devolver():
     persona = persona_de(datos)
     con = db()
     lote = un_lote(con, datos.get("lote_id"))
-    if lote["abierto_en"]:
-        raise ErrorApi("Ese lote está abierto en cocina; primero ciérralo.")
+    if lote["abierto_en"] or con.execute("SELECT 1 FROM salidas_cocina WHERE lote_id=?", (lote["id"],)).fetchone():
+        raise ErrorApi("Cocina ya tomó del lote %s, así que no fue un registro por error. Si hay que sacarlo, elige Caducado o Contaminado." % lote["lote"])
     con.execute("UPDATE traslados SET anulado=1 WHERE lote_id=? AND anulado=0", (lote["id"],))
     con.execute("UPDATE lotes SET en_secundaria=0, principal_vacio=0 WHERE id=?", (lote["id"],))
     anotar(con, persona, "INGRESO_ANULADO", "%s lote %s" % (lote["ingrediente"], lote["lote"]), lote["id"])
@@ -2095,7 +2112,10 @@ def abrir_lote(con, lote, persona, recipiente=1):
            " (recipiente %d)" % recipiente if (lote.get("n_recipientes") or 0) > 1 else ""), lote["id"])
     lineas = con.execute(
         """SELECT li.id, li.produccion_id FROM produccion_lineas li JOIN producciones p ON p.id=li.produccion_id
-           WHERE p.estado='en_curso' AND li.ingrediente_id=?""", (lote["ingrediente_id"],)).fetchall()
+           WHERE p.estado='en_curso' AND li.ingrediente_id=?
+             AND ((p.masa_lista_en IS NULL AND COALESCE(li.despues_reposo,0)=0)
+                  OR (p.masa_lista_en IS NOT NULL AND li.despues_reposo=1))""", (lote["ingrediente_id"],)).fetchall()
+    # Masa en reposo: lo que se abre despues ya no entra en esa masa (solo en los renglones que se agregan al terminar).
     for li in lineas:
         ya = con.execute("SELECT 1 FROM produccion_lotes WHERE linea_id=? AND lote_id=? AND quitado_en IS NULL",
                          (li["id"], lote["id"])).fetchone()
@@ -2337,7 +2357,8 @@ def hoja_de(con, produccion_id):
                FROM produccion_lotes pl JOIN lotes l ON l.id=pl.lote_id
                WHERE pl.linea_id=? ORDER BY pl.id""", (li["id"],)))
         vigentes = [l for l in li["lotes"] if not l["quitado_en"]]
-        li["falta_lote"] = li["tipo"] != "no_aplica" and not li["no_utilizado"] and not vigentes
+        li["falta_lote"] = (li["tipo"] != "no_aplica" and not li["no_utilizado"] and not vigentes
+                            and not (li.get("despues_reposo") and p["estado"] == "en_curso"))
         if li["falta_lote"]:
             p["faltantes"].append(li["etiqueta"])
     return p
@@ -2355,9 +2376,11 @@ def vencimiento(p):
 def resumen_producciones(con, where="1=1", args=()):
     datos = filas(con.execute(
         """SELECT p.id, p.producto_id, p.producto, p.fecha, p.lote_final, p.estado, p.iniciado_en, p.iniciado_por,
-                  p.terminado_en, p.unidades, p.n_etiquetas,
+                  p.terminado_en, p.unidades, p.n_etiquetas, p.masa_lista_en, p.masa_lista_por,
+                  (SELECT lleva_reposo FROM productos pr WHERE pr.id=p.producto_id) AS lleva_reposo,
                   (SELECT COUNT(*) FROM produccion_lineas li WHERE li.produccion_id=p.id AND li.tipo<>'no_aplica'
-                     AND li.no_utilizado=0 AND NOT EXISTS(SELECT 1 FROM produccion_lotes pl
+                     AND li.no_utilizado=0 AND NOT (COALESCE(li.despues_reposo,0)=1 AND p.estado='en_curso')
+                     AND NOT EXISTS(SELECT 1 FROM produccion_lotes pl
                          WHERE pl.linea_id=li.id AND pl.quitado_en IS NULL)) AS faltantes
            FROM producciones p WHERE """ + where + " ORDER BY p.id DESC LIMIT 200", args))
     return datos
@@ -2371,7 +2394,7 @@ def api_productos():
            LEFT JOIN ingredientes i ON i.id=p.produce_ingrediente_id ORDER BY p.activo DESC, p.nombre"""))
     for p in productos:
         p["lineas"] = filas(con.execute(
-            """SELECT r.id, r.orden, r.etiqueta, r.ingrediente_id, i.nombre AS ingrediente, i.tipo
+            """SELECT r.id, r.orden, r.etiqueta, r.ingrediente_id, i.nombre AS ingrediente, i.tipo, COALESCE(r.despues_reposo,0) AS despues_reposo
                FROM receta r JOIN ingredientes i ON i.id=r.ingrediente_id WHERE r.producto_id=? ORDER BY r.orden""",
             (p["id"],)))
         p["componentes"] = filas(con.execute(
@@ -2418,15 +2441,18 @@ def iniciar_produccion():
         raise ErrorApi("No se puede empezar %s: en cocina está abierto un lote caducado: %s. Dalo de baja en Cocina y vuelve a intentarlo." % (
             prod["nombre"], "; ".join(caducados)))
     # Un pan no puede empezar otra vez mientras su produccion anterior siga en curso.
-    previa = con.execute("SELECT lote_final, iniciado_en, iniciado_por FROM producciones WHERE producto_id=? AND estado='en_curso'",
+    # (Un pan con reposo cuya masa ya esta lista si puede empezar otra masa.)
+    previa = con.execute("SELECT lote_final, iniciado_en, iniciado_por FROM producciones WHERE producto_id=? AND estado='en_curso' AND masa_lista_en IS NULL",
                          (prod["id"],)).fetchone()
     if previa:
-        raise ErrorApi("%s ya está en producción (lote %s, empezó %s%s). Cuando termine, toca «Terminó» y recién podrás empezar otra." % (
-            prod["nombre"], previa["lote_final"], previa["iniciado_en"][11:16], " · " + previa["iniciado_por"] if previa["iniciado_por"] else ""))
+        raise ErrorApi("%s ya está en producción (lote %s, empezó %s%s). %s" % (
+            prod["nombre"], previa["lote_final"], previa["iniciado_en"][11:16], " · " + previa["iniciado_por"] if previa["iniciado_por"] else "",
+            "Cuando la masa quede en reposo, toca «Masa lista» y podrás empezar otra." if prod["lleva_reposo"]
+            else "Cuando termine, toca «Terminó» y recién podrás empezar otra."))
     if prod["armado"]:
         raise ErrorApi("«%s» se arma con panes ya producidos: lo registra el encargado en Hojas de producción." % prod["nombre"])
     receta = con.execute(
-        """SELECT r.orden, r.etiqueta, r.ingrediente_id, i.tipo FROM receta r
+        """SELECT r.orden, r.etiqueta, r.ingrediente_id, i.tipo, COALESCE(r.despues_reposo,0) AS despues_reposo FROM receta r
            JOIN ingredientes i ON i.id=r.ingrediente_id WHERE r.producto_id=? ORDER BY r.orden""", (prod["id"],)).fetchall()
     if not receta:
         raise ErrorApi("«%s» todavía no tiene receta. Agrégala en Administrar → Recetas." % prod["nombre"])
@@ -2444,11 +2470,12 @@ def iniciar_produccion():
         (prod["id"], prod["nombre"], hoy.isoformat(), lote_final, momento, persona))
     pid = cur.lastrowid
     for r in receta:
+        despues = 1 if prod["lleva_reposo"] and r["despues_reposo"] else 0
         lin = con.execute(
-            "INSERT INTO produccion_lineas(produccion_id,orden,etiqueta,ingrediente_id,tipo) VALUES(?,?,?,?,?)",
-            (pid, r["orden"], r["etiqueta"], r["ingrediente_id"], r["tipo"]))
-        if r["tipo"] == "no_aplica":
-            continue
+            "INSERT INTO produccion_lineas(produccion_id,orden,etiqueta,ingrediente_id,tipo,despues_reposo) VALUES(?,?,?,?,?,?)",
+            (pid, r["orden"], r["etiqueta"], r["ingrediente_id"], r["tipo"], despues))
+        if r["tipo"] == "no_aplica" or despues:
+            continue                # lo que va despues del reposo se anota desde «Masa lista» hasta «Terminó»
         for lote in listar_lotes(con, "abiertos", r["ingrediente_id"]):
             con.execute("INSERT INTO produccion_lotes(linea_id,lote_id,origen,agregado_en,agregado_por) VALUES(?,?,?,?,?)",
                         (lin.lastrowid, lote["id"], "inicio", momento, persona))
@@ -2507,9 +2534,34 @@ def api_terminar(pid):
     p = hoja_de(con, pid)
     if p["estado"] != "en_curso":
         raise ErrorApi("Esa producción ya estaba terminada.")
-    con.execute("UPDATE producciones SET estado='por_completar', terminado_en=?, terminado_por=? WHERE id=?",
-                (ahora(), persona, pid))
+    momento = ahora()
+    # Renglones que se agregan despues del reposo (ej. relleno): lo que esta abierto al terminar.
+    for li in con.execute("SELECT id, ingrediente_id FROM produccion_lineas WHERE produccion_id=? AND despues_reposo=1 AND tipo<>'no_aplica'",
+                          (pid,)).fetchall():
+        for lote in listar_lotes(con, "abiertos", li["ingrediente_id"]):
+            if not con.execute("SELECT 1 FROM produccion_lotes WHERE linea_id=? AND lote_id=? AND quitado_en IS NULL", (li["id"], lote["id"])).fetchone():
+                con.execute("INSERT INTO produccion_lotes(linea_id,lote_id,origen,agregado_en,agregado_por) VALUES(?,?,?,?,?)",
+                            (li["id"], lote["id"], "al terminar", momento, persona))
+    con.execute("UPDATE producciones SET estado='por_completar', terminado_en=?, terminado_por=?, masa_lista_en=COALESCE(masa_lista_en,?) WHERE id=?",
+                (momento, persona, momento, pid))
     anotar(con, persona, "FIN_PRODUCCION", "%s lote %s" % (p["producto"], p["lote_final"]), produccion_id=pid)
+    con.commit()
+    return jsonify(hoja_de(con, pid))
+
+
+@app.post("/api/producciones/<int:pid>/masa-lista")
+def api_masa_lista(pid):
+    """Pan con reposo: la masa ya se hizo. Desde aqui los lotes que se abran no se anotan en esta masa."""
+    datos = cuerpo()
+    persona = persona_de(datos)
+    con = db()
+    p = hoja_de(con, pid)
+    if p["estado"] != "en_curso":
+        raise ErrorApi("Esa producción ya estaba terminada.")
+    if p.get("masa_lista_en"):
+        raise ErrorApi("La masa ya estaba marcada como lista.")
+    con.execute("UPDATE producciones SET masa_lista_en=?, masa_lista_por=? WHERE id=?", (ahora(), persona, pid))
+    anotar(con, persona, "MASA_LISTA", "%s lote %s: masa en reposo" % (p["producto"], p["lote_final"]), produccion_id=pid)
     con.commit()
     return jsonify(hoja_de(con, pid))
 
@@ -3128,8 +3180,11 @@ def api_producto_guardar():
         ing = con.execute("SELECT nombre FROM ingredientes WHERE id=?", (li.get("ingrediente_id"),)).fetchone()
         if not ing:
             raise ErrorApi("Hay un renglón de la receta sin ingrediente.")
-        con.execute("INSERT INTO receta(producto_id,orden,etiqueta,ingrediente_id) VALUES(?,?,?,?)",
-                    (pid, orden, (str(li.get("etiqueta") or "").strip().upper() or ing["nombre"]), li["ingrediente_id"]))
+        con.execute("INSERT INTO receta(producto_id,orden,etiqueta,ingrediente_id,despues_reposo) VALUES(?,?,?,?,?)",
+                    (pid, orden, (str(li.get("etiqueta") or "").strip().upper() or ing["nombre"]), li["ingrediente_id"],
+                     1 if li.get("despues_reposo") else 0))
+    reposo = 1 if datos.get("lleva_reposo") and not armado and not produce else 0
+    con.execute("UPDATE productos SET lleva_reposo=? WHERE id=?", (reposo, pid))
     anotar(con, persona, "RECETA_EDITADA", nombre)
     con.commit()
     return api_productos()
