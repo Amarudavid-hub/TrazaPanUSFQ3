@@ -21,6 +21,7 @@ Estructura del archivo:
   8. Administracion
 """
 import calendar
+import copy
 import csv
 import datetime as dt
 import hashlib
@@ -2559,7 +2560,7 @@ def vencimiento(p):
     return sumar_meses(dt.date.fromisoformat(p["fecha"]), p.get("vida_util_meses") or 1).isoformat()
 
 
-def resumen_producciones(con, where="1=1", args=()):
+def resumen_producciones(con, where="1=1", args=(), limite=3000, desde=0):
     datos = filas(con.execute(
         """SELECT p.id, p.producto_id, p.producto, p.fecha, p.lote_final, p.estado, p.iniciado_en, p.iniciado_por,
                   p.terminado_en, p.unidades, p.n_etiquetas, p.masa_lista_en, p.masa_lista_por,
@@ -2568,7 +2569,7 @@ def resumen_producciones(con, where="1=1", args=()):
                      AND li.no_utilizado=0 AND NOT (COALESCE(li.despues_reposo,0)=1 AND p.estado='en_curso')
                      AND NOT EXISTS(SELECT 1 FROM produccion_lotes pl
                          WHERE pl.linea_id=li.id AND pl.quitado_en IS NULL)) AS faltantes
-           FROM producciones p WHERE """ + where + " ORDER BY p.id DESC LIMIT 3000", args))
+           FROM producciones p WHERE """ + where + " ORDER BY p.id DESC LIMIT ? OFFSET ?", tuple(args) + (limite, desde)))
     return datos
 
 
@@ -2609,6 +2610,13 @@ def api_productos():
 def api_producciones():
     estado = request.args.get("estado")
     con = db()
+    if request.args.get("pagina"):
+        # Pantalla Hojas: todas las abiertas y las completas de 5 en 5 (no se manda todo el historial).
+        pagina = max(1, request.args.get("pagina", type=int) or 1)
+        total = con.execute("SELECT COUNT(*) FROM producciones WHERE estado='completa'").fetchone()[0]
+        return jsonify(abiertas=resumen_producciones(con, "p.estado IN ('en_curso','por_completar')"),
+                       completas=resumen_producciones(con, "p.estado='completa'", (), POR_PAGINA_HOJAS, (pagina - 1) * POR_PAGINA_HOJAS),
+                       total_completas=total, pagina=pagina, por_pagina=POR_PAGINA_HOJAS)
     if estado:
         return jsonify(resumen_producciones(con, "p.estado=?", (estado,)))
     return jsonify(resumen_producciones(con, "p.estado<>'anulada'"))
@@ -2626,6 +2634,7 @@ def api_producciones_xlsx():
     fino = Side(style="thin", color="999999")
     borde = Border(left=fino, right=fino, top=fino, bottom=fino)
     cab = PatternFill("solid", fgColor="2C344E")
+    alinear = Alignment(vertical="center", wrap_text=True)
     t = lambda x: (x or "")[:16].replace("T", " ") or None
 
     def tabla(hoja, titulo, columnas, datos, anchos):
@@ -2637,11 +2646,18 @@ def api_producciones_xlsx():
             celda = hoja.cell(row=4, column=c, value=txt)
             celda.font, celda.fill, celda.border = Font(bold=True, color="FFFFFF"), cab, borde
             celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        texto = {3, 5} if hoja.title != "Hojas de producción" else {3}      # codigos de lote: como texto
+        # El formato se arma una vez y se copia (asignarlo celda por celda es muy lento con miles de filas).
+        modelo = hoja.cell(row=1, column=60)
+        modelo.border, modelo.alignment = borde, alinear
+        normal = copy.copy(modelo._style)
+        modelo.number_format = "@"
+        como_texto = copy.copy(modelo._style)
+        del hoja._cells[(1, 60)]
         for n, fila in enumerate(datos, 5):
             for c, v in enumerate(fila, 1):
                 celda = hoja.cell(row=n, column=c, value=v)
-                celda.border = borde
-                celda.alignment = Alignment(vertical="center", wrap_text=True)
+                celda._style = copy.copy(como_texto if c in texto else normal)
         for c, ancho in enumerate(anchos, 1):
             hoja.column_dimensions[openpyxl.utils.get_column_letter(c)].width = ancho
         hoja.freeze_panes = "A5"
@@ -2674,9 +2690,6 @@ def api_producciones_xlsx():
     h2 = libro.create_sheet("Ingredientes y lotes")
     tabla(h2, "Ingredientes y lotes de cada hoja", ["FECHA ELABORACIÓN", "PRODUCTO", "LOTE DEL PAN", "INGREDIENTE", "LOTE(S) DEL INGREDIENTE", "CANTIDAD UTILIZADA"],
           filas_ing, [13, 28, 14, 26, 26, 16])
-    for hoja, col in ((h1, 3), (h2, 3), (h2, 5)):
-        for n in range(5, hoja.max_row + 1):
-            hoja.cell(row=n, column=col).number_format = "@"
     salida = io.BytesIO()
     libro.save(salida)
     salida.seek(0)
@@ -2995,6 +3008,7 @@ def api_quitar_lote(pid):
 # 5b. Mix Bread: se arma con unidades de lotes de pan ya producidos
 # ----------------------------------------------------------------------------
 DIAS_MIX = 7     # se pueden usar panes producidos hasta una semana antes (la pantalla muestra primero los 2 mas recientes)
+POR_PAGINA_HOJAS = 5     # hojas completas por pagina en la pantalla Hojas de produccion
 
 
 def disponibles_mix(con, producto_id):

@@ -1308,22 +1308,23 @@ async function preguntarSubrecetaAnterior(p, previos, respuestas) {
 
 // Produccion: el encargado ve lo que se esta produciendo y completa las hojas terminadas.
 async function vistaHojas() {
-  const [lista, productos] = await Promise.all([api('/producciones'), api('/productos')]);
+  const [inicio, productos] = await Promise.all([api('/producciones?pagina=1'), api('/productos')]);
   const mezclas = productos.filter((p) => p.armado && p.activo);
-  const grupo = (estado) => lista.filter((p) => p.estado === estado);
+  const grupo = (estado) => inicio.abiertas.filter((p) => p.estado === estado);
   const textos = {
     en_curso: 'Se están produciendo ahora. Se pueden completar cuando cocina avise que terminaron.',
     por_completar: 'Cocina ya terminó: falta llenar cantidades, horneado y unidades, y cerrar la hoja.',
     completa: '',
   };
-  // Completas: de 5 en 5 («Ver 5 anteriores»).
-  const completas = grupo('completa');
-  let pagCompletas = 1;
+  // Completas: de 5 en 5; cada página se pide al servidor (no se carga todo el historial).
   const cajaCompletas = h('div', null);
-  const pintarCompletas = () => llenar(cajaCompletas,
-    completas.length ? trozo(completas, pagCompletas, 5).map(tarjetaProduccion) : h('p', { class: 'suave' }, 'Ninguna.'),
-    paginador(completas.length, pagCompletas, 5, (n) => { pagCompletas = n; pintarCompletas(); cajaCompletas.scrollIntoView({ block: 'start', behavior: 'smooth' }); }, 'Hojas'));
-  pintarCompletas();
+  const pintarCompletas = (r) => llenar(cajaCompletas,
+    r.completas.length ? r.completas.map(tarjetaProduccion) : h('p', { class: 'suave' }, 'Ninguna.'),
+    paginador(r.total_completas, r.pagina, r.por_pagina, (n) => intentar(async () => {
+      pintarCompletas(await api('/producciones?pagina=' + n));
+      cajaCompletas.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }), 'Hojas'));
+  pintarCompletas(inicio);
   pintar(encabezado('Hojas de producción'),
     h('div', { class: 'fila-botones', style: 'margin-top:0' }, h('button', { class: 'boton', type: 'button',
       onclick: () => { location.href = '/api/producciones.xlsx'; } }, 'Descargar Excel de todas las hojas')),
@@ -1332,7 +1333,8 @@ async function vistaHojas() {
         h('b', null, p.nombre), h('small', null, p.componentes.map((c) => c.nombre).join(' · ') || 'Sin panes definidos'))))] : null,
     ['por_completar', 'en_curso', 'completa'].map((estado) => {
       const g = grupo(estado);
-      return [h('h2', null, NOMBRE_ESTADO[estado] + ' ', h('span', { class: 'num' + (estado === 'por_completar' && g.length ? ' rojo' : '') }, g.length)),
+      const cuantas = estado === 'completa' ? inicio.total_completas : g.length;
+      return [h('h2', null, NOMBRE_ESTADO[estado] + ' ', h('span', { class: 'num' + (estado === 'por_completar' && g.length ? ' rojo' : '') }, cuantas)),
         textos[estado] ? h('p', { class: 'chico suave' }, textos[estado]) : null,
         estado === 'completa' ? cajaCompletas : g.length ? g.map(tarjetaProduccion) : h('p', { class: 'suave' }, 'Ninguna.')];
     }));
