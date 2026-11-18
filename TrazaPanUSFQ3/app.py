@@ -180,8 +180,17 @@ def _error_api(e):
 LIBRES = {"/api/sesion", "/api/entrar", "/api/salir"}
 
 
-def claves_activas(con):
+def claves_guardadas(con):
     return con.execute("SELECT COUNT(*) FROM claves_area").fetchone()[0] > 0
+
+
+def claves_pausadas(con):
+    return con.execute("SELECT 1 FROM meta WHERE clave='claves_pausadas'").fetchone() is not None
+
+
+def claves_activas(con):
+    """Se pide contraseña si hay contraseñas guardadas y no están en pausa."""
+    return claves_guardadas(con) and not claves_pausadas(con)
 
 
 @app.before_request
@@ -226,8 +235,8 @@ def api_claves():
     d = cuerpo()
     persona = persona_de(d)
     con = db()
-    activas = claves_activas(con)
-    if activas and session.get("area") != "produccion":
+    activas = claves_guardadas(con)
+    if claves_activas(con) and session.get("area") != "produccion":
         raise ErrorApi("Solo Producción puede cambiar las contraseñas.", 403)
     nuevas = {a: str(c or "") for a, c in (d.get("claves") or {}).items() if a in AREAS_LOGIN and str(c or "").strip()}
     if not activas and set(nuevas) != set(AREAS_LOGIN):
@@ -250,8 +259,32 @@ def api_claves():
 
 @app.get("/api/claves")
 def api_claves_estado():
-    filas_ = {f["area"]: f["cambiado_en"] for f in db().execute("SELECT area, cambiado_en FROM claves_area")}
-    return jsonify(activas=bool(filas_), areas=[{"area": a, "nombre": n, "cambiado_en": filas_.get(a)} for a, n in AREAS_LOGIN.items()])
+    con = db()
+    filas_ = {f["area"]: f["cambiado_en"] for f in con.execute("SELECT area, cambiado_en FROM claves_area")}
+    return jsonify(activas=bool(filas_), pausadas=claves_pausadas(con),
+                   areas=[{"area": a, "nombre": n, "cambiado_en": filas_.get(a)} for a, n in AREAS_LOGIN.items()])
+
+
+@app.post("/api/claves/pausa")
+def api_claves_pausa():
+    """Pausar o volver a pedir las contraseñas (las contraseñas guardadas no se borran)."""
+    d = cuerpo()
+    persona = persona_de(d)
+    con = db()
+    if not claves_guardadas(con):
+        raise ErrorApi("Todavía no hay contraseñas.")
+    if claves_activas(con) and session.get("area") != "produccion":
+        raise ErrorApi("Solo Producción puede pausar las contraseñas.", 403)
+    if d.get("pausar"):
+        con.execute("INSERT OR REPLACE INTO meta(clave,valor) VALUES('claves_pausadas',?)", (ahora(),))
+        anotar(con, persona, "CLAVES_PAUSADAS", "Se dejó de pedir contraseña")
+    else:
+        con.execute("DELETE FROM meta WHERE clave='claves_pausadas'")
+        anotar(con, persona, "CLAVES_REANUDADAS", "Se vuelve a pedir contraseña")
+        session.permanent = True
+        session["area"] = "produccion"     # quien las reanuda sigue dentro
+    con.commit()
+    return jsonify(ok=True, pausadas=bool(d.get("pausar")))
 
 
 @app.errorhandler(413)
@@ -291,6 +324,8 @@ def preparar_base():
         # Si la base se creo sin ingredientes, se repiten los ajustes que los necesitan.
         con.execute("DELETE FROM meta WHERE clave IN ('v7_mezclas','v8_recipientes','v11_catalogo_ingredientes','v14_subrecetas')")
     sembrar_mezclas(con)
+    # Subrecetas y Mix Bread no tienen etapa de masa.
+    con.execute("UPDATE productos SET lleva_reposo=0 WHERE COALESCE(armado,0)=1 OR produce_ingrediente_id IS NOT NULL")
     # En un servidor en internet: la contraseña inicial de las tres áreas viene de TRAZAPAN_CLAVE_INICIAL.
     inicial = os.environ.get("TRAZAPAN_CLAVE_INICIAL", "").strip()
     if inicial and not con.execute("SELECT 1 FROM claves_area").fetchone():
@@ -312,6 +347,14 @@ COLUMNAS_RECEPCION = [
 
 
 def migrar(con):
+    # Version 20: inventarios mensuales. Bodega principal no registra lo que va a otras areas: los lotes que ya no
+    # estan se cierran al hacer inventario (en bodega principal y en bodega secundaria).
+    con.execute("""CREATE TABLE IF NOT EXISTS inventarios(
+        id INTEGER PRIMARY KEY, lugar TEXT NOT NULL, fecha_hora TEXT NOT NULL, persona TEXT,
+        revisados INTEGER DEFAULT 0, cerrados INTEGER DEFAULT 0)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS inventario_lotes(
+        id INTEGER PRIMARY KEY, inventario_id INTEGER NOT NULL REFERENCES inventarios(id), lote_id INTEGER NOT NULL REFERENCES lotes(id),
+        esta INTEGER NOT NULL, reabierto_en TEXT, reabierto_por TEXT)""")
     # Version 19: panes con reposo (la masa se hace un dia y se termina al siguiente).
     #   productos.lleva_reposo: muestra el boton "Masa lista"; receta.despues_reposo: renglon que se agrega al dia
     #   siguiente (por ejemplo el relleno); producciones.masa_lista_en: desde ahi la masa ya no recibe lotes nuevos.
@@ -439,6 +482,29 @@ CATALOGO_INGREDIENTE = {
 NO_PANADERIA = ["JAMON AMERICANO REBANADO PAQUETE (1KG)", "FUNDA VACIO GRANDE", "FUNDA VACIO MEDIANA"]
 
 
+def ingrediente_propio(con, alias_id):
+    """Un producto de bodega se llama igual en toda la app: si no tiene ingrediente, se crea uno con su mismo nombre."""
+    alias = con.execute("SELECT * FROM alias WHERE id=?", (alias_id,)).fetchone()
+    if not alias or alias["ingrediente_id"] or alias["ignorar"]:
+        return
+    con.execute("INSERT OR IGNORE INTO ingredientes(nombre,tipo,refrigerado) VALUES(?,?,0)", (alias["producto"], "lote"))
+    ing = con.execute("SELECT id FROM ingredientes WHERE nombre=?", (alias["producto"],)).fetchone()
+    con.execute("UPDATE alias SET ingrediente_id=?, auto=0 WHERE id=?", (ing["id"], alias_id))
+
+
+def renombrar_ingrediente_unico(con, alias_id):
+    """Si el ingrediente es solo de este producto, toma el nombre del producto (el mismo en bodega, cocina e inventario).
+    La hoja de producción no cambia: sus renglones tienen su propio nombre (el de la receta)."""
+    a = con.execute("SELECT * FROM alias WHERE id=?", (alias_id,)).fetchone()
+    if not a or not a["ingrediente_id"] or a["ignorar"]:
+        return
+    otros = con.execute("SELECT COUNT(*) FROM alias WHERE ingrediente_id=? AND id<>? AND en_catalogo=1 AND ignorar=0",
+                        (a["ingrediente_id"], alias_id)).fetchone()[0]
+    ocupado = con.execute("SELECT 1 FROM ingredientes WHERE nombre=? AND id<>?", (a["producto"], a["ingrediente_id"])).fetchone()
+    if not otros and not ocupado:
+        con.execute("UPDATE ingredientes SET nombre=? WHERE id=? AND tipo='lote'", (a["producto"], a["ingrediente_id"]))
+
+
 def agregar_al_catalogo(con, nombre):
     """Pone un producto en la lista de bodega principal, con el nombre escrito tal cual. Devuelve el id del alias."""
     alias_id, _ = alias_para(con, nombre)
@@ -491,6 +557,22 @@ def sembrar_mezclas(con):
     if not con.execute("SELECT 1 FROM meta WHERE clave='v8_recipientes'").fetchone():
         con.execute("UPDATE ingredientes SET recipientes=2 WHERE nombre='HARINA DE TRIGO'")    # la harina de trigo tiene 2
         con.execute("INSERT INTO meta(clave,valor) VALUES('v8_recipientes',?)", (ahora(),))
+    if not con.execute("SELECT 1 FROM meta WHERE clave='v22_todos_reposo'").fetchone():
+        # Version 22: todos los panes se hacen con la masa un dia y la coccion al siguiente.
+        # Lo que se pone al terminar: relleno y glace (las subrecetas, menos la masa madre, que va en la masa).
+        con.execute("UPDATE productos SET lleva_reposo=1 WHERE COALESCE(armado,0)=0 AND produce_ingrediente_id IS NULL")
+        con.execute("""UPDATE receta SET despues_reposo=1 WHERE ingrediente_id IN (
+                         SELECT id FROM ingredientes WHERE tipo='interno' AND nombre NOT LIKE '%MASA MADRE%')
+                       AND producto_id IN (SELECT id FROM productos WHERE COALESCE(armado,0)=0 AND produce_ingrediente_id IS NULL)
+                       AND producto_id NOT IN (SELECT DISTINCT producto_id FROM receta WHERE despues_reposo=1)""")
+        con.execute("INSERT INTO meta(clave,valor) VALUES('v22_todos_reposo',?)", (ahora(),))
+    if not con.execute("SELECT 1 FROM meta WHERE clave='v21_mismo_nombre'").fetchone():
+        # Version 21: cada producto de bodega se llama igual en bodega principal, bodega secundaria, cocina e inventario.
+        for a in con.execute("SELECT id FROM alias WHERE en_catalogo=1 AND ignorar=0").fetchall():
+            ingrediente_propio(con, a["id"])
+            renombrar_ingrediente_unico(con, a["id"])
+        materializar(con)
+        con.execute("INSERT INTO meta(clave,valor) VALUES('v21_mismo_nombre',?)", (ahora(),))
     if con.execute("SELECT 1 FROM meta WHERE clave='v7_mezclas'").fetchone():
         return
     for nombre, codigo, panes in MEZCLAS_INICIALES:
@@ -508,6 +590,7 @@ def sembrar_mezclas(con):
                 if comp:
                     con.execute("INSERT INTO composicion(producto_id,orden,componente_id) VALUES(?,?,?)", (pid, orden, comp["id"]))
     con.execute("INSERT INTO meta(clave,valor) VALUES('v7_mezclas',?)", (ahora(),))
+
 
 
 # Copia de semilla.json dentro del programa (por si el archivo no se copio junto con app.py).
@@ -858,10 +941,9 @@ def cuerpo():
 
 
 def persona_de(datos):
+    """Quien registra: el area del dispositivo (Bodega principal, Producción o Cocina)."""
     nombre = str(datos.get("persona") or "").strip()
-    if not nombre:
-        raise ErrorApi("Primero elige quién eres en la pantalla de inicio.")
-    return nombre
+    return nombre or AREAS_LOGIN.get(session.get("area"), "Sin área")
 
 
 def anotar(con, persona, tipo, detalle="", lote_id=None, produccion_id=None):
@@ -1357,13 +1439,13 @@ def api_producto_bodega_nuevo():
     if previo:
         raise ErrorApi("Ya está en la lista como «%s»." % previo["producto"])
     alias_id = agregar_al_catalogo(con, nombre)
+    ingrediente_propio(con, alias_id)
+    materializar(con)
     anotar(con, persona, "PRODUCTO_BODEGA_NUEVO", nombre)
     con.commit()
     alias = con.execute("SELECT a.*, i.nombre AS ingrediente FROM alias a LEFT JOIN ingredientes i ON i.id=a.ingrediente_id WHERE a.id=?",
                         (alias_id,)).fetchone()
-    return jsonify(producto=nombre, ingrediente=alias["ingrediente"],
-                   aviso="" if alias["ingrediente_id"] or alias["ignorar"] else
-                   "Producción debe indicar a qué ingrediente corresponde (Administrar → Pendientes).")
+    return jsonify(id=alias_id, producto=nombre, ingrediente=alias["ingrediente"], aviso="")
 
 
 @app.post("/api/bodega/unidades")
@@ -1382,6 +1464,40 @@ def api_unidad_nueva():
     anotar(con, persona, "UNIDAD_NUEVA", nombre)
     con.commit()
     return jsonify(unidad=nombre, unidades=unidades_lista(con))
+
+
+@app.post("/api/bodega/productos/<int:alias_id>/nombre")
+def api_producto_bodega_nombre(alias_id):
+    """Cambia el nombre de un producto de bodega (las recepciones anteriores quedan con el producto, con el nombre nuevo)."""
+    d = cuerpo()
+    persona = persona_de(d)
+    nombre = " ".join(str(d.get("nombre") or "").upper().split())
+    if len(nombre) < 3:
+        raise ErrorApi("Escribe el nombre del producto.")
+    con = db()
+    alias = con.execute("SELECT * FROM alias WHERE id=?", (alias_id,)).fetchone()
+    if not alias:
+        raise ErrorApi("Ese producto no existe.", 404)
+    if nombre == alias["producto"]:
+        return jsonify(ok=True)
+    otro = con.execute("SELECT producto FROM alias WHERE clave=? AND id<>?", (normalizar(nombre), alias_id)).fetchone()
+    if otro:
+        raise ErrorApi("Ya existe un producto llamado «%s»." % otro["producto"])
+    # La foto incluida en la app depende del nombre: se copia para que no se pierda al cambiarlo.
+    foto = alias["foto"]
+    if not foto:
+        archivo = nombre_archivo(alias["producto"]) + ".webp"
+        carpeta = carpeta_foto_incluida(archivo)
+        if carpeta:
+            os.makedirs(FOTOS_PRODUCTOS, exist_ok=True)
+            foto = "%d_%s.webp" % (alias_id, uuid.uuid4().hex[:8])
+            with open(os.path.join(carpeta, archivo), "rb") as origen, open(os.path.join(FOTOS_PRODUCTOS, foto), "wb") as destino:
+                destino.write(origen.read())
+    con.execute("UPDATE alias SET producto=?, clave=?, foto=? WHERE id=?", (nombre, normalizar(nombre), foto, alias_id))
+    renombrar_ingrediente_unico(con, alias_id)
+    anotar(con, persona, "PRODUCTO_BODEGA_NOMBRE", "%s → %s" % (alias["producto"], nombre))
+    con.commit()
+    return jsonify(ok=True)
 
 
 @app.post("/api/bodega/productos/<int:alias_id>/lista")
@@ -1408,13 +1524,12 @@ SALIDAS_SQL = """SELECT o.id, o.area, o.cantidad, o.unidad, o.motivo, o.fecha_ho
            FROM salidas_areas o JOIN lotes l ON l.id=o.lote_id JOIN ingredientes i ON i.id=l.ingrediente_id"""
 
 
-@app.get("/api/bodega/salidas.xlsx")
-def api_salidas_xlsx():
-    """Todo lo que paso de bodega principal a otras areas (y los cierres de lote), mas el estado actual de los lotes."""
+@app.get("/api/inventarios.xlsx")
+def api_inventarios_xlsx():
+    """Inventarios (resumen y cada lote revisado), bajas y semaforo de caducidad de bodega principal."""
     import openpyxl
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     con = db()
-    datos = filas(con.execute(SALIDAS_SQL + " ORDER BY o.id"))
     lotes = listar_lotes(con, "principal", limite=2000)
     lotes.sort(key=lambda l: (ORDEN_SEMAFORO[l["semaforo"]], l["caducidad"] or "9999", l["id"]))
     libro = openpyxl.Workbook()
@@ -1459,19 +1574,32 @@ def api_salidas_xlsx():
             return t
 
     entero = lambda x: int(x) if x is not None and x == int(x) else x
+    lugares = {"principal": "BODEGA PRINCIPAL", "secundaria": "BODEGA SECUNDARIA", "cocina": "COCINA"}
     hoja = libro.active
-    hoja.title = "Pasos a otras áreas"
-    tabla(hoja, "Pasos de bodega principal a otras áreas y cierres de lote",
-          ["FECHA Y HORA", "PRODUCTO", "LOTE", "CANTIDAD", "UNIDAD", "DESTINO", "MOTIVO", "REGISTRÓ", "ESTADO", "MOTIVO DE ANULACIÓN"],
-          [[fecha_hora(o["fecha_hora"]), o["producto_bodega"] or o["ingrediente"], o["lote"], entero(o["cantidad"]), o["unidad"],
-            "CIERRE DEL LOTE" if o["area"] == AREA_AJUSTE else "BAJA" if o["area"] == "BAJA" else o["area"], o["motivo"] or None, o["persona"],
-            "ANULADO" if o["anulado"] else "VIGENTE", o["motivo_anulacion"] or None] for o in datos],
-          [17, 34, 16, 11, 10, 17, 30, 18, 11, 28])
-    for n, o in enumerate(datos, 5):
-        if o["anulado"]:
-            for c in range(1, 11):
-                hoja.cell(row=n, column=c).font = Font(color="999999", strike=c < 9)
-        hoja.cell(row=n, column=3).number_format = "@"
+    hoja.title = "Inventarios"
+    invs = filas(con.execute("SELECT * FROM inventarios ORDER BY id"))
+    tabla(hoja, "Inventarios realizados",
+          ["FECHA Y HORA", "BODEGA", "REGISTRÓ", "LOTES REVISADOS", "SIGUEN EN BODEGA", "YA NO ESTABAN (SE CERRARON)"],
+          [[fecha_hora(i["fecha_hora"]), lugares.get(i["lugar"], i["lugar"]), i["persona"], i["revisados"], i["revisados"] - i["cerrados"], i["cerrados"]]
+           for i in invs], [17, 20, 18, 12, 12, 16])
+    detalle = filas(con.execute(
+        """SELECT inv.fecha_hora, inv.lugar, inv.persona, il.esta, il.reabierto_en, il.reabierto_por, l.lote, i.nombre AS ingrediente,
+                  (SELECT a.producto FROM recepciones r JOIN alias a ON a.id=r.alias_id WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS producto,
+                  (SELECT r.proveedor FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS proveedor,
+                  COALESCE((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1), l.caducidad) AS caducidad
+           FROM inventario_lotes il JOIN inventarios inv ON inv.id=il.inventario_id JOIN lotes l ON l.id=il.lote_id
+           JOIN ingredientes i ON i.id=l.ingrediente_id ORDER BY inv.id, il.esta, i.nombre"""))
+    hoja_d = libro.create_sheet("Lotes revisados")
+    tabla(hoja_d, "Cada lote revisado en los inventarios",
+          ["FECHA DEL INVENTARIO", "BODEGA", "PRODUCTO", "LOTE", "PROVEEDOR", "CADUCIDAD", "RESULTADO", "REABIERTO", "REGISTRÓ"],
+          [[fecha_hora(d["fecha_hora"]), lugares.get(d["lugar"], d["lugar"]), d["producto"] or d["ingrediente"], d["lote"], d["proveedor"],
+            fecha(d["caducidad"]), "ESTÁ" if d["esta"] else "YA NO ESTÁ (CERRADO)",
+            ("Sí, " + d["reabierto_en"][:16].replace("T", " ") + " · " + (d["reabierto_por"] or "")) if d["reabierto_en"] else None, d["persona"]]
+           for d in detalle], [17, 20, 34, 16, 20, 12, 22, 24, 18])
+    for n, d in enumerate(detalle, 5):
+        hoja_d.cell(row=n, column=4).number_format = "@"
+        if not d["esta"]:
+            hoja_d.cell(row=n, column=7).fill = PatternFill("solid", fgColor="F4C7C3")
     bajas_todas = filas(con.execute(
         """SELECT b.fecha_hora, b.lugar, i.nombre AS ingrediente, l.lote, b.cantidad, b.unidad, b.motivo, b.comentario, b.persona,
                   b.anulado, b.motivo_anulacion FROM bajas b JOIN lotes l ON l.id=b.lote_id JOIN ingredientes i ON i.id=l.ingrediente_id
@@ -1479,7 +1607,6 @@ def api_salidas_xlsx():
            SELECT o.fecha_hora, 'principal', i.nombre, l.lote, o.cantidad, o.unidad, o.motivo, '', o.persona, o.anulado, o.motivo_anulacion
            FROM salidas_areas o JOIN lotes l ON l.id=o.lote_id JOIN ingredientes i ON i.id=l.ingrediente_id WHERE o.area='BAJA'
            ORDER BY 1"""))
-    lugares = {"principal": "BODEGA PRINCIPAL", "secundaria": "BODEGA SECUNDARIA", "cocina": "COCINA"}
     hoja_b = libro.create_sheet("Bajas")
     tabla(hoja_b, "Lotes dados de baja (caducados o contaminados)",
           ["FECHA Y HORA", "LUGAR", "INGREDIENTE", "LOTE", "CANTIDAD", "UNIDAD", "MOTIVO", "COMENTARIO", "REGISTRÓ", "ESTADO", "MOTIVO DE ANULACIÓN"],
@@ -1491,13 +1618,11 @@ def api_salidas_xlsx():
         hoja_b.cell(row=n, column=4).number_format = "@"
     hoja2 = libro.create_sheet("Semáforo de caducidad")
     nombre_color = {"rojo": "CADUCADO", "amarillo": "POR CADUCAR", "verde": "BUEN TIEMPO", None: "SIN FECHA"}
-    tabla(hoja2, "Lotes con saldo en bodega principal (semáforo de caducidad)",
-          ["SEMÁFORO", "PRODUCTO", "LOTE", "PROVEEDOR", "CADUCIDAD", "DÍAS PARA CADUCAR", "RECIBIDO", "A PANADERÍA",
-           "A OTRAS ÁREAS", "QUEDAN", "UNIDAD"],
-          [[nombre_color[l["semaforo"]], l["producto_bodega"] or l["ingrediente"], l["lote"], l["proveedor"], fecha(l["caducidad"]),
-            l["dias_caducidad"], entero(l["recibido"]), entero(l["trasladado"]), entero(l["otras_areas"]), entero(l["disponible"]),
-            l["unidad"]] for l in lotes],
-          [15, 34, 16, 20, 12, 11, 10, 11, 11, 10, 10])
+    tabla(hoja2, "Lotes en bodega principal (semáforo de caducidad)",
+          ["SEMÁFORO", "PRODUCTO", "LOTE", "PROVEEDOR", "INGRESÓ", "CADUCIDAD", "DÍAS PARA CADUCAR"],
+          [[nombre_color[l["semaforo"]], l["producto_bodega"] or l["ingrediente"], l["lote"], l["proveedor"], fecha(l["fecha_ingreso"]),
+            fecha(l["caducidad"]), l["dias_caducidad"]] for l in lotes],
+          [15, 34, 16, 20, 12, 12, 11])
     colores = {"rojo": "F4C7C3", "amarillo": "FFF0B3", "verde": "CDEBD6"}
     for n, l in enumerate(lotes, 5):
         if l["semaforo"] in colores:
@@ -1506,8 +1631,93 @@ def api_salidas_xlsx():
     salida = io.BytesIO()
     libro.save(salida)
     salida.seek(0)
-    return send_file(salida, as_attachment=True, download_name="Pasos_a_otras_areas_%s.xlsx" % dt.date.today().strftime("%Y-%m-%d"),
+    return send_file(salida, as_attachment=True, download_name="Inventarios_%s.xlsx" % dt.date.today().strftime("%Y-%m-%d"),
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ----------------------------------------------------------------------------
+# Inventario (cada mes): se revisa cada bodega y los lotes que ya no estan se cierran.
+# ----------------------------------------------------------------------------
+DIAS_INVENTARIO = 30
+LUGARES_INVENTARIO = {"principal": "bodega principal", "secundaria": "bodega secundaria"}
+
+
+def ultimo_inventario(con, lugar):
+    fila = con.execute("SELECT * FROM inventarios WHERE lugar=? ORDER BY id DESC LIMIT 1", (lugar,)).fetchone()
+    if not fila:
+        return None
+    d = dict(fila)
+    d["dias"] = (dt.date.today() - dt.date.fromisoformat(d["fecha_hora"][:10])).days
+    return d
+
+
+@app.get("/api/inventarios")
+def api_inventarios():
+    lugar = request.args.get("lugar", "principal")
+    if lugar not in LUGARES_INVENTARIO:
+        raise ErrorApi("Lugar desconocido.")
+    con = db()
+    lista = filas(con.execute("SELECT * FROM inventarios WHERE lugar=? ORDER BY id DESC LIMIT 1000", (lugar,)))
+    for inv in lista:
+        inv["cerrados_lotes"] = filas(con.execute(
+            """SELECT il.id, il.reabierto_en, il.reabierto_por, l.id AS lote_id, l.lote, i.nombre AS ingrediente,
+                      (SELECT a.producto FROM recepciones r JOIN alias a ON a.id=r.alias_id WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS producto
+               FROM inventario_lotes il JOIN lotes l ON l.id=il.lote_id JOIN ingredientes i ON i.id=l.ingrediente_id
+               WHERE il.inventario_id=? AND il.esta=0 ORDER BY i.nombre""", (inv["id"],)))
+    return jsonify(inventarios=lista, ultimo=ultimo_inventario(con, lugar), dias_inventario=DIAS_INVENTARIO,
+                   lotes=listar_lotes(con, lugar, limite=2000))
+
+
+@app.post("/api/inventarios")
+def api_inventario_guardar():
+    """Guarda un inventario: items = [{lote_id, esta}]. Los que ya no estan salen de esa bodega."""
+    datos = cuerpo()
+    persona = persona_de(datos)
+    lugar = datos.get("lugar")
+    if lugar not in LUGARES_INVENTARIO:
+        raise ErrorApi("Lugar desconocido.")
+    items = datos.get("items") or []
+    if not items:
+        raise ErrorApi("No hay lotes para revisar.")
+    con = db()
+    actuales = {l["id"] for l in listar_lotes(con, lugar, limite=5000)}
+    inv = con.execute("INSERT INTO inventarios(lugar,fecha_hora,persona) VALUES(?,?,?)", (lugar, ahora(), persona)).lastrowid
+    revisados = cerrados = 0
+    for it in items:
+        lote_id = int(it.get("lote_id") or 0)
+        if lote_id not in actuales:
+            continue                       # ya no estaba en la lista (otro dispositivo lo movio)
+        esta = 1 if it.get("esta", True) else 0
+        con.execute("INSERT INTO inventario_lotes(inventario_id,lote_id,esta) VALUES(?,?,?)", (inv, lote_id, esta))
+        revisados += 1
+        if not esta:
+            cerrados += 1
+            con.execute("UPDATE lotes SET principal_vacio=1 WHERE id=?" if lugar == "principal"
+                        else "UPDATE lotes SET en_secundaria=0 WHERE id=?", (lote_id,))
+    con.execute("UPDATE inventarios SET revisados=?, cerrados=? WHERE id=?", (revisados, cerrados, inv))
+    anotar(con, persona, "INVENTARIO", "Inventario de %s: %d lotes revisados, %d ya no estaban" % (LUGARES_INVENTARIO[lugar], revisados, cerrados))
+    con.commit()
+    return jsonify(id=inv, revisados=revisados, cerrados=cerrados)
+
+
+@app.post("/api/inventarios/lotes/<int:il_id>/reabrir")
+def api_inventario_reabrir(il_id):
+    """Un lote se marco por error como «ya no está»: vuelve a la bodega."""
+    datos = cuerpo()
+    persona = persona_de(datos)
+    con = db()
+    fila = con.execute("""SELECT il.*, inv.lugar, l.lote FROM inventario_lotes il JOIN inventarios inv ON inv.id=il.inventario_id
+                          JOIN lotes l ON l.id=il.lote_id WHERE il.id=?""", (il_id,)).fetchone()
+    if not fila or fila["esta"]:
+        raise ErrorApi("Ese lote no se cerró en el inventario.", 404)
+    if fila["reabierto_en"]:
+        raise ErrorApi("Ese lote ya se había vuelto a poner.")
+    con.execute("UPDATE lotes SET principal_vacio=0 WHERE id=?" if fila["lugar"] == "principal"
+                else "UPDATE lotes SET en_secundaria=1 WHERE id=?", (fila["lote_id"],))
+    con.execute("UPDATE inventario_lotes SET reabierto_en=?, reabierto_por=? WHERE id=?", (ahora(), persona, il_id))
+    anotar(con, persona, "INVENTARIO_REABRIR", "Lote %s vuelve a %s" % (fila["lote"], LUGARES_INVENTARIO[fila["lugar"]]), fila["lote_id"])
+    con.commit()
+    return jsonify(ok=True)
 
 
 @app.get("/api/bodega/lotes")
@@ -1526,34 +1736,6 @@ def lote_de_principal(con, lote_id):
     if lote["origen"] == "interno" or lote["agotado"] or lote["principal_vacio"]:
         raise ErrorApi("El lote %s ya no está en bodega principal." % lote["lote"])
     return lote
-
-
-@app.post("/api/bodega/salidas")
-def api_salida_area():
-    """Bodega principal despacha parte de un lote a otra área (pastelería, carnicería)."""
-    d = cuerpo()
-    persona = persona_de(d)
-    con = db()
-    lote = lote_de_principal(con, d.get("lote_id"))
-    area_destino = " ".join(str(d.get("area") or "").upper().split())
-    if area_destino not in AREAS_DESTINO:
-        raise ErrorApi("Elige el área a la que salió.")
-    cantidad = numero(d.get("cantidad"))
-    if cantidad is None or cantidad <= 0:
-        raise ErrorApi("Escribe cuánto salió (solo el número).")
-    unidad = lote["unidad"] or ""
-    if lote["disponible"] is not None and cantidad > lote["disponible"] + 1e-9:
-        raise ErrorApi("Del lote %s solo quedan %s %s en bodega principal." % (lote["lote"], fmt(lote["disponible"]), unidad))
-    con.execute("INSERT INTO salidas_areas(lote_id,cantidad,unidad,area,fecha_hora,persona) VALUES(?,?,?,?,?,?)",
-                (lote["id"], cantidad, unidad, area_destino, ahora(), persona))
-    vacio = lote["disponible"] is not None and cantidad >= lote["disponible"] - 1e-9
-    if vacio:
-        con.execute("UPDATE lotes SET principal_vacio=1 WHERE id=?", (lote["id"],))
-    anotar(con, persona, "SALIDA_OTRA_AREA", "%s lote %s: %s %s a %s%s" % (
-        lote["ingrediente"], lote["lote"], fmt(cantidad), unidad, area_destino,
-        " (ya no queda en bodega principal)" if vacio else ""), lote["id"])
-    con.commit()
-    return jsonify(ok=True, vacio=vacio)
 
 
 @app.post("/api/bodega/lotes/<int:lote_id>/terminar")
@@ -1998,8 +2180,12 @@ def api_ingredientes():
         for ing in datos:
             ing["n_" + donde] = cuenta.get(ing["id"], 0)
     fotos = fotos_por_ingrediente(con)
+    # Un ingrediente de proveedor sigue activo mientras su producto este en la lista de bodega principal
+    # (si se elimina el producto, deja de aparecer en bodega secundaria, cocina y recetas).
+    activos = {f[0] for f in con.execute("SELECT DISTINCT ingrediente_id FROM alias WHERE en_catalogo=1 AND ignorar=0 AND ingrediente_id IS NOT NULL")}
     for ing in datos:
         ing["foto"] = fotos.get(ing["id"])
+        ing["activo"] = ing["tipo"] != "lote" or ing["id"] in activos
     return jsonify(datos)
 
 
@@ -2382,8 +2568,24 @@ def resumen_producciones(con, where="1=1", args=()):
                      AND li.no_utilizado=0 AND NOT (COALESCE(li.despues_reposo,0)=1 AND p.estado='en_curso')
                      AND NOT EXISTS(SELECT 1 FROM produccion_lotes pl
                          WHERE pl.linea_id=li.id AND pl.quitado_en IS NULL)) AS faltantes
-           FROM producciones p WHERE """ + where + " ORDER BY p.id DESC LIMIT 200", args))
+           FROM producciones p WHERE """ + where + " ORDER BY p.id DESC LIMIT 3000", args))
     return datos
+
+
+@app.post("/api/productos/<int:pid>/activo")
+def api_producto_activo(pid):
+    """Eliminar un producto (pan, subreceta o Mix Bread) o volver a producirlo. Las hojas ya hechas no se tocan."""
+    d = cuerpo()
+    persona = persona_de(d)
+    con = db()
+    prod = con.execute("SELECT * FROM productos WHERE id=?", (pid,)).fetchone()
+    if not prod:
+        raise ErrorApi("Ese producto no existe.", 404)
+    activo = 1 if d.get("activo") else 0
+    con.execute("UPDATE productos SET activo=? WHERE id=?", (activo, pid))
+    anotar(con, persona, "PRODUCTO_" + ("RESTAURADO" if activo else "ELIMINADO"), prod["nombre"])
+    con.commit()
+    return jsonify(ok=True)
 
 
 @app.get("/api/productos")
@@ -2412,6 +2614,76 @@ def api_producciones():
     return jsonify(resumen_producciones(con, "p.estado<>'anulada'"))
 
 
+@app.get("/api/producciones.xlsx")
+def api_producciones_xlsx():
+    """Todas las hojas de produccion hasta hoy (sin anuladas): una hoja de Excel con cada produccion y otra con cada ingrediente y su lote."""
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    con = db()
+    ids = [f[0] for f in con.execute("SELECT id FROM producciones WHERE estado<>'anulada' ORDER BY fecha, id")]
+    hojas = [hoja_de(con, i) for i in ids]
+    libro = openpyxl.Workbook()
+    fino = Side(style="thin", color="999999")
+    borde = Border(left=fino, right=fino, top=fino, bottom=fino)
+    cab = PatternFill("solid", fgColor="2C344E")
+    t = lambda x: (x or "")[:16].replace("T", " ") or None
+
+    def tabla(hoja, titulo, columnas, datos, anchos):
+        hoja["A1"] = titulo
+        hoja["A1"].font = Font(bold=True, size=13)
+        hoja["A2"] = "San Francisco FoodService · descargado el " + dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+        hoja["A2"].font = Font(italic=True, color="5F677B")
+        for c, txt in enumerate(columnas, 1):
+            celda = hoja.cell(row=4, column=c, value=txt)
+            celda.font, celda.fill, celda.border = Font(bold=True, color="FFFFFF"), cab, borde
+            celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for n, fila in enumerate(datos, 5):
+            for c, v in enumerate(fila, 1):
+                celda = hoja.cell(row=n, column=c, value=v)
+                celda.border = borde
+                celda.alignment = Alignment(vertical="center", wrap_text=True)
+        for c, ancho in enumerate(anchos, 1):
+            hoja.column_dimensions[openpyxl.utils.get_column_letter(c)].width = ancho
+        hoja.freeze_panes = "A5"
+        if datos:
+            hoja.auto_filter.ref = "A4:%s%d" % (openpyxl.utils.get_column_letter(len(columnas)), 4 + len(datos))
+
+    estados = {"en_curso": "EN CURSO", "por_completar": "POR COMPLETAR", "completa": "COMPLETA"}
+    h1 = libro.active
+    h1.title = "Hojas de producción"
+    tabla(h1, "Hojas de producción",
+          ["FECHA ELABORACIÓN", "PRODUCTO", "LOTE", "TIPO", "ESTADO", "VENCE", "INICIO DE MASA", "MASA LISTA", "FIN DE PRODUCCIÓN",
+           "HOJA CERRADA", "UNIDADES PRODUCIDAS", "UNIDADES PARA EL LOTE", "UNIDAD", "HORNEADO", "ETIQUETAS", "OBSERVACIONES", "RESPONSABLE"],
+          [[dt.date.fromisoformat(p["fecha"]).strftime("%d/%m/%Y"), p["producto"], p["lote_final"],
+            "Mix Bread" if p["armado"] else "Subreceta" if p["produce_ingrediente_id"] else "Pan",
+            estados.get(p["estado"], p["estado"]), dt.date.fromisoformat(p["fecha_vencimiento"]).strftime("%d/%m/%Y") if p.get("fecha_vencimiento") else None,
+            t(p["iniciado_en"]), t(p.get("masa_lista_en")), t(p["terminado_en"]), t(p.get("completado_en")),
+            p["unidades"] or None, p.get("unidades_lote") or None, p.get("unidad_sub") or None, p["horneado"] or None,
+            p["n_etiquetas"], p["observaciones"] or None, p["iniciado_por"]] for p in hojas],
+          [13, 28, 14, 11, 15, 12, 16, 16, 16, 16, 12, 12, 9, 18, 10, 30, 16])
+    filas_ing = []
+    for p in hojas:
+        for li in p["lineas"]:
+            vig = [l["lote"] for l in li["lotes"] if not l["quitado_en"]]
+            filas_ing.append([dt.date.fromisoformat(p["fecha"]).strftime("%d/%m/%Y"), p["producto"], p["lote_final"], li["etiqueta"],
+                              "No aplica" if li["tipo"] == "no_aplica" else ", ".join(vig) if vig else "No se utilizó" if li["no_utilizado"] else "SIN LOTE",
+                              li["cantidad"] or None])
+        for comp in p.get("componentes") or []:
+            filas_ing.append([dt.date.fromisoformat(p["fecha"]).strftime("%d/%m/%Y"), p["producto"], p["lote_final"], comp.get("producto"),
+                              comp.get("lote_final"), comp.get("unidades")])
+    h2 = libro.create_sheet("Ingredientes y lotes")
+    tabla(h2, "Ingredientes y lotes de cada hoja", ["FECHA ELABORACIÓN", "PRODUCTO", "LOTE DEL PAN", "INGREDIENTE", "LOTE(S) DEL INGREDIENTE", "CANTIDAD UTILIZADA"],
+          filas_ing, [13, 28, 14, 26, 26, 16])
+    for hoja, col in ((h1, 3), (h2, 3), (h2, 5)):
+        for n in range(5, hoja.max_row + 1):
+            hoja.cell(row=n, column=col).number_format = "@"
+    salida = io.BytesIO()
+    libro.save(salida)
+    salida.seek(0)
+    return send_file(salida, as_attachment=True, download_name="Hojas_de_produccion_%s.xlsx" % dt.date.today().isoformat(),
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 @app.get("/api/producciones/<int:pid>")
 def api_hoja(pid):
     return jsonify(hoja_de(db(), pid))
@@ -2430,9 +2702,11 @@ def iniciar_produccion():
     datos = cuerpo()
     persona = persona_de(datos)
     con = db()
-    prod = con.execute("SELECT * FROM productos WHERE id=? AND activo=1", (datos.get("producto_id"),)).fetchone()
+    prod = con.execute("SELECT * FROM productos WHERE id=?", (datos.get("producto_id"),)).fetchone()
     if not prod:
         raise ErrorApi("Elige el producto.")
+    if not prod["activo"]:
+        raise ErrorApi("%s fue eliminado de las recetas: no se puede empezar." % prod["nombre"])
     # No se empieza si en cocina hay abierto un lote caducado de algun ingrediente de la receta.
     de_receta = {f[0] for f in con.execute("SELECT ingrediente_id FROM receta WHERE producto_id=?", (prod["id"],))}
     caducados = ["%s de %s (caducó el %s)" % (l["lote"], g["ingrediente"], dia_texto(l["caducidad"]))
@@ -2617,11 +2891,14 @@ def api_guardar(pid):
                 (unidades,
                  str(datos.get("horneado", p["horneado"]) or "").strip(),
                  str(datos.get("observaciones", p["observaciones"]) or "").strip(), etiquetas, pid))
-    propias = {li["id"] for li in p["lineas"]}
+    propias = {li["id"]: li for li in p["lineas"]}
     for li in datos.get("lineas") or []:
         if li.get("id") in propias:
-            con.execute("UPDATE produccion_lineas SET cantidad=?, no_utilizado=? WHERE id=?",
-                        (str(li.get("cantidad") or "").strip(), 1 if li.get("no_utilizado") else 0, li["id"]))
+            no_usado = 1 if li.get("no_utilizado") else 0
+            cantidad = "" if no_usado else str(li.get("cantidad") or "").strip()
+            if cantidad and numero(cantidad) is None:
+                raise ErrorApi("La cantidad utilizada de %s debe ser solo un número." % propias[li["id"]]["etiqueta"])
+            con.execute("UPDATE produccion_lineas SET cantidad=?, no_utilizado=? WHERE id=?", (cantidad, no_usado, li["id"]))
     if datos.get("cerrar"):
         p = hoja_de(con, pid)
         if p["estado"] == "en_curso":
@@ -2630,6 +2907,23 @@ def api_guardar(pid):
             con.commit()
             raise ErrorApi("Guardado, pero la hoja no se puede cerrar: falta el lote de " + ", ".join(p["faltantes"])
                            + ". Agrega el lote o marca «No se utilizó».")
+        # Para cerrar, todos los campos llenos (menos observaciones).
+        vacios = []
+        if p["produce_ingrediente_id"]:
+            pass        # subrecetas (relleno, glace, masa madre): la cantidad es opcional
+        else:
+            for campo, nombre in (("unidades", "unidades producidas"), ("unidades_lote", "unidades para el lote"), ("horneado", "horneado")):
+                if not str(p[campo] or "").strip():
+                    vacios.append(nombre)
+            if not p["n_etiquetas"]:
+                vacios.append("etiquetas a imprimir")
+        sin_cantidad = [] if p["produce_ingrediente_id"] else [
+            li["etiqueta"] for li in p["lineas"] if not li["no_utilizado"] and not str(li["cantidad"] or "").strip()]
+        if sin_cantidad:
+            vacios.append("cantidad utilizada de " + ", ".join(sin_cantidad))
+        if vacios:
+            con.commit()
+            raise ErrorApi("Guardado, pero la hoja no se puede cerrar. Falta llenar: " + "; ".join(vacios) + ".")
         con.execute("UPDATE producciones SET estado='completa', completado_en=?, completado_por=? WHERE id=?",
                     (ahora(), persona, pid))
         anotar(con, persona, "HOJA_COMPLETA", "%s lote %s" % (p["producto"], p["lote_final"]), produccion_id=pid)
@@ -2700,7 +2994,7 @@ def api_quitar_lote(pid):
 # ----------------------------------------------------------------------------
 # 5b. Mix Bread: se arma con unidades de lotes de pan ya producidos
 # ----------------------------------------------------------------------------
-DIAS_MIX = 3     # se pueden usar panes producidos hoy y en los 2 dias anteriores
+DIAS_MIX = 7     # se pueden usar panes producidos hasta una semana antes (la pantalla muestra primero los 2 mas recientes)
 
 
 def disponibles_mix(con, producto_id):
@@ -3019,6 +3313,8 @@ def api_estado():
         recepciones_hoy=uno("SELECT COUNT(*) FROM recepciones WHERE origen='app' AND anulado=0 AND fecha_ingreso=date('now','localtime')"),
         caducados_principal=sum(1 for l in principal if l["semaforo"] == "rojo"),
         por_caducar_principal=sum(1 for l in principal if l["semaforo"] == "amarillo"),
+        inventario_principal=ultimo_inventario(con, "principal"), inventario_secundaria=ultimo_inventario(con, "secundaria"),
+        dias_inventario=DIAS_INVENTARIO,
         hoy=dt.date.today().isoformat())
 
 
@@ -3183,7 +3479,7 @@ def api_producto_guardar():
         con.execute("INSERT INTO receta(producto_id,orden,etiqueta,ingrediente_id,despues_reposo) VALUES(?,?,?,?,?)",
                     (pid, orden, (str(li.get("etiqueta") or "").strip().upper() or ing["nombre"]), li["ingrediente_id"],
                      1 if li.get("despues_reposo") else 0))
-    reposo = 1 if datos.get("lleva_reposo") and not armado and not produce else 0
+    reposo = 0 if armado or produce else 1      # todos los panes: inicio de masa, masa lista y fin de produccion
     con.execute("UPDATE productos SET lleva_reposo=? WHERE id=?", (reposo, pid))
     anotar(con, persona, "RECETA_EDITADA", nombre)
     con.commit()
@@ -3258,7 +3554,15 @@ def api_agotar_antiguos():
 
 @app.get("/api/movimientos")
 def api_movimientos():
-    return jsonify(filas(db().execute(
+    """Historial de cambios. Con ?pagina=n devuelve de 30 en 30 con el total; sin pagina, los ultimos (limite)."""
+    con = db()
+    if request.args.get("pagina"):
+        por = 30
+        pag = max(1, request.args.get("pagina", 1, type=int))
+        total = con.execute("SELECT COUNT(*) FROM movimientos").fetchone()[0]
+        datos = filas(con.execute("SELECT * FROM movimientos ORDER BY id DESC LIMIT ? OFFSET ?", (por, (pag - 1) * por)))
+        return jsonify(datos=datos, total=total, pagina=pag, por_pagina=por)
+    return jsonify(filas(con.execute(
         "SELECT * FROM movimientos ORDER BY id DESC LIMIT ?", (request.args.get("limite", 300, type=int),))))
 
 

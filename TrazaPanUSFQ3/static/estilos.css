@@ -91,7 +91,7 @@ button, .boton { font: inherit; cursor: pointer; }
 .nota.rojo { background: var(--alerta-claro); color: #7a241b; }
 .nota.verde { background: var(--ok-claro); color: #1d5433; }
 
-.pie-fijo { position: fixed; left: 0; right: 0; bottom: 0; padding: .7rem 1rem calc(.7rem + env(safe-area-inset-bottom)); background: #fffdf9ee; border-top: 1px solid var(--linea); backdrop-filter: blur(6px); z-index: 4; }
+.pie-fijo { position: fixed; left: 0; right: 0; bottom: 0; padding: .7rem 1rem calc(.7rem + env(safe-area-inset-bottom)); background: #ffffffee; border-top: 1px solid var(--linea); backdrop-filter: blur(6px); z-index: 4; }
 .pie-fijo > div { max-width: 860px; margin: 0 auto; display: flex; gap: .6rem; }
 
 /* Formularios */
@@ -322,3 +322,105 @@ button.volver { border: 0; font-family: inherit; cursor: pointer; }
 .tarjeta.tarjeta-sem.borde-rojo { border-left: 8px solid #d0342c; }
 .tarjeta.tarjeta-sem.borde-amarillo { border-left: 8px solid #e6a700; }
 .tarjeta.tarjeta-sem.borde-verde { border-left: 8px solid #2c9a57; }
+
+/* Inventario: lista de chequeo por producto; cada lote se toca para marcar «Ya no está» */
+.inv-grupo { padding: .8rem .9rem; }
+.inv-titulo { display: flex; align-items: center; gap: .7rem; margin-bottom: .5rem; font-size: 1.05rem; }
+.inv-titulo .foto-prod { width: 44px; height: 44px; }
+.inv-lote { display: flex; align-items: center; gap: .7rem; width: 100%; text-align: left; font: inherit; cursor: pointer;
+  background: var(--papel); border: 1.5px solid var(--linea); border-radius: 12px; padding: .55rem .7rem; margin: .35rem 0; flex-wrap: wrap; }
+.inv-lote .inv-marca { width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 800; flex: none; }
+.inv-lote .inv-datos { display: flex; flex-direction: column; flex: 1; min-width: 140px; }
+.inv-lote .inv-estado { font-weight: 700; font-size: .9rem; margin-left: auto; }
+.inv-lote.esta .inv-marca { background: var(--ok-claro); color: #1d5433; }
+.inv-lote.esta .inv-estado { color: #1d5433; }
+.inv-lote.no-esta { background: var(--alerta-claro); border-color: #d0342c; }
+.inv-lote.no-esta .inv-marca { background: #d0342c; color: #fff; }
+.inv-lote.no-esta .inv-estado { color: #7a241b; }
+.inv-lote.no-esta .inv-datos b { text-decoration: line-through; }
+.fila-cerrado { display: flex; justify-content: space-between; align-items: center; gap: .6rem; padding: .35rem 0;
+  border-top: 1px dashed var(--linea); flex-wrap: wrap; }
+
+/* Administrar → Productos de bodega */
+.fila-producto.falta-asignar { border-color: #e6a700; }
+details.eliminados { margin-top: 1.2rem; }
+details.eliminados summary { cursor: pointer; font-weight: 700; color: var(--tinta-suave); padding: .4rem 0; }
+
+/* Registro del mes de bodega principal: 15 por página en pantalla; al imprimir salen todos */
+tr.fuera-pagina { display: none; }
+@media print { tr.fuera-pagina:not(.no-imprimir) { display: table-row; } }
+.paginador { display: flex; align-items: center; justify-content: center; gap: .9rem; margin: .8rem 0; flex-wrap: wrap; }
+.paginador span { color: var(--tinta-suave); font-size: .92rem; }
+
+/* Administrar → Productos de bodega: foto, nombre y acciones en una sola fila */
+.tarjeta.prod-bodega { display: flex; align-items: center; gap: 1rem; padding: .8rem 1rem; }
+.prod-bodega .prod-foto { width: 64px; height: 64px; flex: none; border-radius: 12px; }
+.prod-bodega .prod-foto.sin-foto { font-size: 1.5rem; }
+.prod-bodega .prod-nombre { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .15rem; }
+.prod-bodega .prod-nombre b { font-size: 1.02rem; }
+.prod-bodega .prod-acciones { display: flex; gap: .4rem; flex-wrap: wrap; justify-content: flex-end; }
+.prod-bodega .prod-acciones .boton { margin: 0; }
+@media (max-width: 700px) {
+  .tarjeta.prod-bodega { flex-wrap: wrap; }
+  .prod-bodega .prod-acciones { width: 100%; justify-content: flex-start; }
+}
+/* Recetas: opciones grandes */
+.opciones-receta { display: flex; gap: .6rem; flex-wrap: wrap; margin: .9rem 0 .4rem; }
+.opcion-grande { display: inline-flex !important; align-items: center; gap: .55rem; margin: 0 !important; padding: .65rem 1rem;
+  border: 1.5px solid var(--linea); border-radius: 12px; background: var(--papel); font-weight: 600 !important; font-size: 1rem; cursor: pointer; }
+.opcion-grande input[type=checkbox] { width: 22px; height: 22px; accent-color: var(--trigo); margin: 0; }
+.opcion-grande:has(input:checked) { border-color: var(--trigo); background: var(--trigo-claro); }
+
+/* Hoja de producción: campo obligatorio vacío al intentar cerrar */
+.campo-vacio { border-color: #d0342c !important; background: #fdf0ef !important; }
+
+/* Hoja de producción impresa (A4): documento formal, independiente de la pantalla */
+@page hojaprod { size: A4 portrait; margin: 0; }
+@media print {
+  .hoja-impresa { page: hojaprod; padding: 13mm 14mm 10mm; font-size: 10.5pt; color: #111; }
+  .hoja-impresa table { width: 100%; border-collapse: collapse; border: 0; border-radius: 0; background: #fff; margin: 0 0 4mm; }
+  .hoja-impresa td, .hoja-impresa th { border: 0.8pt solid #2C344E !important; padding: 2.2mm 2.6mm; vertical-align: middle; text-align: left; font-size: 10pt; }
+  .hoja-impresa th { background: #2C344E !important; color: #fff !important; font-size: 8pt; text-transform: uppercase; letter-spacing: .05em;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .hoja-impresa .centro { text-align: center; }
+  .hoja-impresa .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 700; }
+  .imp-cabecera td { border-width: 1.2pt !important; }
+  .imp-logo { width: 26%; text-align: center !important; }
+  .imp-logo img { height: 14mm; width: auto; }
+  .imp-titulo { text-align: center !important; font-size: 8.5pt !important; letter-spacing: .14em; color: #2C344E; font-weight: 700; }
+  .imp-titulo .imp-producto { font-size: 17pt; letter-spacing: 0; color: #111; margin-top: 1mm; }
+  .imp-lote { width: 24%; text-align: center !important; }
+  .imp-codigo { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 16pt; font-weight: 800; letter-spacing: .04em; }
+  .imp-etq { font-size: 7pt; text-transform: uppercase; letter-spacing: .06em; color: #5f677b; font-weight: 600; }
+  .imp-valor { font-size: 10.5pt; font-weight: 600; margin-top: .6mm; }
+  .imp-datos td { width: 25%; }
+  .imp-sub { font-size: 8.5pt; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; color: #2C344E; margin: 5mm 0 1.6mm; }
+  .imp-tabla tbody tr:nth-child(even) td { background: #f2f4f8 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .imp-nota { font-size: 9pt; margin: 0 0 3mm; }
+  .imp-observaciones { border: 0.8pt solid #2C344E; min-height: 20mm; padding: 2.5mm; white-space: pre-wrap; }
+  .imp-firmas { margin-top: 16mm !important; }
+  .imp-firmas td { border: 0 !important; width: 50%; text-align: center !important; padding: 0 10mm; font-weight: 600; font-size: 9.5pt; }
+  .imp-linea { border-top: 0.8pt solid #111; margin-bottom: 1.5mm; }
+  .imp-pie { margin-top: 8mm; font-size: 7pt; color: #5f677b; text-align: right; }
+}
+
+/* Recetas: datos a la izquierda; Editar y Eliminar siempre juntos a la derecha */
+.receta-fila { padding: .9rem 1.1rem; }
+.receta-contenido { display: flex; align-items: center; gap: 1rem; }
+.receta-datos { flex: 1; min-width: 0; }
+.receta-datos > b { font-size: 1.05rem; margin-right: .35rem; }
+.receta-datos .chico { margin-top: .3rem; line-height: 1.45; }
+.acciones-receta { display: flex; gap: .5rem; align-items: center; flex: none; }
+.acciones-receta .boton { margin: 0; min-width: 92px; justify-content: center; text-align: center; }
+@media (max-width: 600px) {
+  .receta-contenido { flex-wrap: wrap; }
+  .acciones-receta { width: 100%; }
+  .acciones-receta .boton { flex: 1; }
+}
+.receta-datos .etq + .etq { margin-left: .3rem; }
+
+/* Contraseñas: estado y botón de pausa */
+.estado-claves { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
+.estado-claves > div { flex: 1; min-width: 180px; }
+.estado-claves .boton { margin: 0; }
