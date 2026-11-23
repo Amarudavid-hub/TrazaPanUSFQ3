@@ -67,11 +67,26 @@ function modal(titulo, contenido, botones, obligatoria) {
   return new Promise((resolver) => {
     const cerrar = (valor) => { document.removeEventListener('keydown', alTeclear); velo.remove(); resolver(valor); };
     const alTeclear = (e) => { if (e.key === 'Escape' && !obligatoria) cerrar(null); };
+    // Si falta algo, el mensaje sale dentro de la ventana y no se pierde lo escrito.
+    // b.accion: se ejecuta con la ventana abierta (por ejemplo, guardar); si falla, la ventana sigue abierta.
+    const error = h('div', { class: 'error-modal', role: 'alert', hidden: true });
+    const pulsar = async (b, boton) => {
+      error.hidden = true;
+      try {
+        if (b.accion) {
+          boton.disabled = true;
+          try { const r = await b.accion(); cerrar(r === undefined ? true : r); } finally { boton.disabled = false; }
+        } else cerrar(typeof b.valor === 'function' ? b.valor() : b.valor);
+      } catch (ex) {
+        error.textContent = ex.message; error.hidden = false;
+        error.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    };
     const caja = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' },
       obligatoria ? null : h('button', { class: 'cerrar-modal', type: 'button', 'aria-label': 'Cancelar', title: 'Cancelar', onclick: () => cerrar(null) }, '×'),
-      h('h2', null, titulo), contenido,
+      h('h2', null, titulo), contenido, error,
       (botones || []).map((b) => h('button', { class: 'boton ' + (b.clase || ''), type: 'button',
-        onclick: () => cerrar(typeof b.valor === 'function' ? b.valor() : b.valor) }, b.texto)));
+        onclick: (e) => pulsar(b, e.currentTarget) }, b.texto)));
     const velo = h('div', { class: 'velo' }, caja);
     document.addEventListener('keydown', alTeclear);
     document.body.append(velo);
@@ -170,15 +185,19 @@ async function darDeBaja(l, lugar, disponible) {
       h('label', null, '¿Cuántas ' + u + ' se sacan de ' + nombres[lugar] + '?'), cantidad,
       disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + cantidadLote(Math.max(disponible, 0), l) + '.') : null,
       h('label', null, 'Comentario'), comentario)),
-  [{ texto: 'Dar de baja', clase: 'peligro-lleno', valor: () => ({ lote_id: l.id, lugar, motivo: motivo.valor, cantidad: cantidad.value.trim(), comentario: comentario.value.trim() }) },
+  [{ texto: 'Dar de baja', clase: 'peligro-lleno', accion: async () => {
+      const datos = { lote_id: l.id, lugar, motivo: motivo.valor, cantidad: cantidad.value.trim(), comentario: comentario.value.trim() };
+      if (!datos.motivo) throw new Error('Elige el motivo.');
+      if (datos.motivo === 'ERROR') { await api('/secundaria/devolver', { lote_id: l.id }); return { devuelto: true }; }
+      return api('/bajas', datos);
+    } },
     { texto: 'Cancelar', valor: null }]);
   if (!d) return false;
-  if (d.motivo === 'ERROR') {
-    await api('/secundaria/devolver', { lote_id: l.id });
+  if (d.devuelto) {
     avisar('Ingreso del lote ' + l.lote + ' anulado: vuelve a bodega principal', 'bien');
     return true;
   }
-  const r = await api('/bajas', d);
+  const r = d;
   avisar('Lote ' + l.lote + ' dado de baja' + (r.vacio ? '' : ' (parcial)'), 'bien');
   return true;
 }
@@ -397,16 +416,14 @@ async function loteManual(ing, destino) {
       h('label', null, 'Fecha de caducidad (la del empaque)'), caducidad,
       h('label', null, 'Foto del empaque donde se ve el lote'), foto.el,
       h('label', null, 'Comentario'), nota),
-    [{ texto: 'Registrar', clase: 'principal', valor: () => ({ lote: codigo.value.trim(), nota: nota.value.trim(), archivo: foto.archivo,
-      cantidad: cant, caducidad: caducidad.value }) },
+    [{ texto: 'Registrar', clase: 'principal', accion: () => api('/lotes/manual', { ingrediente_id: ing.id, lote: codigo.value.trim(),
+      nota: nota.value.trim(), destino, cantidad: cant, caducidad: caducidad.value }) },
       { texto: 'Cancelar', valor: null }]);
   foto.apagar();
   if (!datos) return false;
-  const r = await intentar(() => api('/lotes/manual', { ingrediente_id: ing.id, lote: datos.lote, nota: datos.nota, destino,
-    cantidad: datos.cantidad, caducidad: datos.caducidad }));
-  if (!r) return false;
-  if (datos.archivo) {
-    const blob = await reducirFoto(datos.archivo);
+  const r = datos;
+  if (foto.archivo) {
+    const blob = await reducirFoto(foto.archivo);
     if (blob) await intentar(async () => {
       const resp = await fetch('/api/lotes/' + r.lote_id + '/foto', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: blob });
       if (!resp.ok) throw new Error('El lote se registró, pero la foto no se pudo guardar.');
@@ -772,12 +789,15 @@ function formRecepcion(cat, ini, editar) {
       h('div', { class: 'en-linea empaque-linea' }, h('b', null, '1'), empaque, h('b', null, '='), contenido, unidadC),
       h('div', { class: 'chico suave' }, 'Ejemplo: 1 botella = 500 ml · 1 paquete = 50 kg · 1 cubeta = 30 huevos'),
       h('label', null, 'Foto del producto (opcional)'), foto.el),
-    [{ texto: 'Agregar', clase: 'principal', valor: () => ({ nombre: campo.value.trim().toUpperCase(), empaque: empaque.value,
-      contenido: contenido.value.trim(), unidad_contenido: unidadC.value }) }, { texto: 'Cancelar', valor: null }]);
+    [{ texto: 'Agregar', clase: 'principal', accion: () => {
+      const d = { nombre: campo.value.trim().toUpperCase(), empaque: empaque.value, contenido: contenido.value.trim(), unidad_contenido: unidadC.value };
+      if (!d.nombre) throw new Error('Escribe el nombre del producto.');
+      if (!d.contenido) throw new Error('Escribe cuánto trae cada ' + nombreEmpaque(d.empaque, 1) + '.');
+      return api('/bodega/productos', d);
+    } }, { texto: 'Cancelar', valor: null }]);
     foto.apagar();
-    if (!datos || !datos.nombre) return;
-    if (!datos.contenido) throw new Error('Escribe cuánto trae cada ' + nombreEmpaque(datos.empaque, 1) + '.');
-    const r = await api('/bodega/productos', datos);
+    if (!datos) return;
+    const r = datos;
     if (foto.archivo) {
       try { await subirFotoProducto(r.id, foto.archivo); } catch (e) { avisar('El producto se agregó, pero la foto no se pudo guardar: ' + e.message); }
     }
@@ -812,11 +832,11 @@ function formRecepcion(cat, ini, editar) {
     campo('Observaciones', c.observaciones, 'completo'),
     h('div', { class: 'campo completo fotos-recepcion' },
       h('div', null, h('label', null, 'Foto del lote (etiqueta)'),
-        editar && ini.foto_lote ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + ini.foto_lote, 'Lote ' + ini.lote_texto) }, 'Ver la foto guardada (puedes reemplazarla)') : null,
-        fotos.lote.el),
+        fotos.lote.el,
+        editar && ini.foto_lote ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + ini.foto_lote, 'Lote ' + ini.lote_texto) }, 'Ver la foto guardada (puedes reemplazarla)') : null),
       h('div', null, h('label', null, 'Foto de la requisición'),
-        editar && ini.foto_requisicion ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + ini.foto_requisicion, 'Requisición') }, 'Ver la foto guardada (puedes reemplazarla)') : null,
-        fotos.requisicion.el)));
+        fotos.requisicion.el,
+        editar && ini.foto_requisicion ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + ini.foto_requisicion, 'Requisición') }, 'Ver la foto guardada (puedes reemplazarla)') : null)));
 
   ponerEmpaque(editar ? cat.productos.find((p) => p.producto === ini.producto) || null : null);
   const leer = () => ({
@@ -853,10 +873,13 @@ async function registrarEntradaAviso(a) {
     h('div', { class: 'nota' }, 'Cocina ya tomó ', h('b', null, cuanto(a.tomado_cocina)), '. Escribe cuánto entró a bodega secundaria de este lote (si cocina se llevó todo, deja el mismo número).'),
     h('div', { class: 'campo' }, h('label', null, 'Cuánto entró', e ? ' (' + nombreEmpaque(e.empaque, 2) + ')' : ''), campo, eq),
     h('div', { class: 'campo' }, h('label', null, 'Fecha de caducidad'), cad)),
-    [{ texto: 'Guardar', clase: 'principal', valor: true }, { texto: 'Cancelar', valor: null }]);
+    [{ texto: 'Guardar', clase: 'principal', accion: async () => {
+      if (!cant || Number(cant) < ya) throw new Error('No puede ser menos de lo que cocina ya tomó (' + cuanto(ya) + ').');
+      if (!cad.value) throw new Error('Falta la fecha de caducidad.');
+      await api('/avisos/' + a.id + '/entrada', { cantidad: cant, caducidad: cad.value });
+      return true;
+    } }, { texto: 'Cancelar', valor: null }]);
   if (!ok) return false;
-  if (!cant || Number(cant) < ya) throw new Error('No puede ser menos de lo que cocina ya tomó (' + cuanto(ya) + ').');
-  await api('/avisos/' + a.id + '/entrada', { cantidad: cant, caducidad: cad.value });
   avisar(a.tiene_recepcion ? 'Listo. Se avisó a bodega principal.' : 'Listo. Se avisó a bodega principal para que registre la recepción.', 'bien');
   return true;
 }
@@ -884,11 +907,14 @@ async function registrarDesdeAviso(a, hayMas) {
   f.campos.cantidad.addEventListener('input', pintar);
   pintar();
   const datos = await modal('Registrar la recepción del lote ' + a.lote, h('div', null, info, f.el),
-    [{ texto: 'Guardar recepción', clase: 'principal', valor: () => f.leer() }, { texto: 'Cancelar', valor: null }]);
+    [{ texto: 'Guardar recepción', clase: 'principal', accion: async () => {
+      const d = f.leer();
+      if (hayMas && Number(d.cantidad) <= ya) throw new Error('Si hay más en bodega principal, el total tiene que ser mayor que ' + cuanto(ya) + '.');
+      return api('/recepciones', Object.assign(d, { aviso_id: a.id }));
+    } }, { texto: 'Cancelar', valor: null }]);
   Object.values(f.fotos).forEach((x) => x.apagar());
   if (!datos) return false;
-  if (hayMas && Number(datos.cantidad) <= ya) throw new Error('Si hay más en bodega principal, el total tiene que ser mayor que ' + cuanto(ya) + '.');
-  const r = await api('/recepciones', Object.assign(datos, { aviso_id: a.id }));
+  const r = datos;
   await subirFotosRecepcion(r.id, f.fotos);
   avisar('Recepción registrada · lote ' + r.lote_texto, 'bien');
   return true;
@@ -898,19 +924,20 @@ async function registrarDesdeAviso(a, hayMas) {
 async function corregirRecepcion(cat, r) {
   const f = formRecepcion(cat, r, true);
   const motivo = h('input', { type: 'text', placeholder: !r.caducidad ? 'Opcional si solo agregas la caducidad' : 'ej. la cantidad estaba mal escrita' });
+  const conFotos = () => Object.values(f.fotos).some((x) => x.archivo);
   const datos = await modal('Corregir recepción', h('div', null, f.el, h('label', null, 'Motivo de la corrección (queda registrado)'), motivo),
-    [{ texto: 'Guardar corrección', clase: 'principal', valor: () => Object.assign(f.leer(), { motivo: motivo.value.trim() }) },
-      { texto: 'Cancelar', valor: null }]);
+    [{ texto: 'Guardar corrección', clase: 'principal', accion: async () => {
+      try {
+        await api('/recepciones/' + r.id + '/editar', Object.assign(f.leer(), { motivo: motivo.value.trim() }));
+      } catch (e) {
+        if (!(conFotos() && /No cambiaste nada/.test(e.message))) throw e;      // solo se agregó una foto
+      }
+      return true;
+    } }, { texto: 'Cancelar', valor: null }]);
   Object.values(f.fotos).forEach((x) => x.apagar());
   if (!datos) return false;
-  const conFotos = Object.values(f.fotos).some((x) => x.archivo);
   await subirFotosRecepcion(r.id, f.fotos);
-  try {
-    await api('/recepciones/' + r.id + '/editar', datos);
-  } catch (e) {
-    if (!(conFotos && /No cambiaste nada/.test(e.message))) throw e;      // solo se agregó una foto
-  }
-  avisar(conFotos ? 'Guardado (con foto)' : 'Corrección guardada', 'bien');
+  avisar(conFotos() ? 'Guardado (con foto)' : 'Corrección guardada', 'bien');
   return true;
 }
 
@@ -1314,10 +1341,12 @@ async function vistaCocina(pestana) {
       h('p', { style: 'margin-top:0' }, h('b', null, u.ingrediente), ' | ', h('b', { class: 'mono' }, listaLotes(u.lotes))),
       h('p', { class: 'chico suave' }, 'Están mezclados: se dan de baja los ' + u.lotes.length + ' lotes y dejan de anotarse en los panes.'),
       h('label', null, 'Motivo'), motivo.el, h('label', null, 'Comentario'), comentario),
-    [{ texto: 'Dar de baja los ' + u.lotes.length + ' lotes', clase: 'peligro-lleno', valor: () => ({ motivo: motivo.valor, comentario: comentario.value.trim() }) },
+    [{ texto: 'Dar de baja los ' + u.lotes.length + ' lotes', clase: 'peligro-lleno', accion: () => {
+      if (!motivo.valor) throw new Error('Elige el motivo.');
+      return { motivo: motivo.valor, comentario: comentario.value.trim() };
+    } },
       { texto: 'Cancelar', valor: null }]);
     if (!d) return;
-    if (!d.motivo) throw new Error('Elige el motivo.');
     for (const l of u.lotes) await api('/bajas', { lote_id: l.id, lugar: 'cocina', motivo: d.motivo, cantidad: '', comentario: d.comentario });
     avisar('Recipiente dado de baja', 'bien'); vistaCocina();
   });
@@ -1911,10 +1940,10 @@ async function editarDestino(d) {
     h('div', { class: 'dos-col' },
       h('div', null, h('label', null, 'Persona de contacto'), c.contacto), h('div', null, h('label', null, 'Correo'), c.correo)),
     h('label', null, 'Dirección'), c.direccion, h('label', null, 'Notas'), c.notas),
-  [{ texto: d.id ? 'Guardar cambios' : 'Agregar destino', clase: 'principal', valor: () => Object.fromEntries(Object.entries(c).map(([k, el]) => [k, el.value.trim()])) },
+  [{ texto: d.id ? 'Guardar cambios' : 'Agregar destino', clase: 'principal',
+    accion: () => api(d.id ? '/destinos/' + d.id : '/destinos', Object.fromEntries(Object.entries(c).map(([k, el]) => [k, el.value.trim()]))) },
     { texto: 'Cancelar', valor: null }]);
-  if (!r) return null;
-  return api(d.id ? '/destinos/' + d.id : '/destinos', r);
+  return r || null;
 }
 
 function datosDestino(d) {
@@ -1931,11 +1960,13 @@ async function bajaCongelador(l, motivos) {
     h('label', null, 'Motivo'), motivo.el,
     h('label', null, '¿Cuántos paquetes?'), cant, h('div', { class: 'chico suave' }, 'Quedan ' + plural(l.saldo, 'paquete', 'paquetes') + '.'),
     h('label', null, 'Comentario'), comentario),
-  [{ texto: 'Dar de baja', clase: 'peligro-lleno', valor: () => ({ produccion_id: l.produccion_id, motivo: motivo.valor, paquetes: cant.value, comentario: comentario.value.trim() }) },
+  [{ texto: 'Dar de baja', clase: 'peligro-lleno', accion: async () => {
+      if (!motivo.valor) throw new Error('Elige el motivo.');
+      await api('/congelador/bajas', { produccion_id: l.produccion_id, motivo: motivo.valor, paquetes: cant.value, comentario: comentario.value.trim() });
+      return true;
+    } },
     { texto: 'Cancelar', valor: null }]);
   if (!d) return false;
-  if (!d.motivo) throw new Error('Elige el motivo.');
-  await api('/congelador/bajas', d);
   avisar('Baja registrada', 'bien');
   return true;
 }

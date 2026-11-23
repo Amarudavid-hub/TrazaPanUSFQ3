@@ -478,3 +478,5 @@ tr.fuera-pagina { display: none; }
 .unidad-fija.vacia { background: transparent; border: 1px dashed var(--borde, #cfd5e2); }
 .acciones-aviso { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
 .fotos-recepcion label { display: block; }
+.error-modal { background: var(--alerta-claro); color: #7a241b; border-radius: 10px; padding: .6rem .8rem; margin: .8rem 0 .2rem; font-size: .92rem; font-weight: 600; }
+.error-modal[hidden] { display: none; }
