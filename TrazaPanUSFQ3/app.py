@@ -2177,6 +2177,11 @@ def api_recepcion_nueva():
          v["rechazado"], persona, ahora(), ahora()))
     materializar(con)
     rec = recepcion(con, cur.lastrowid)
+    if rec["lote_id"]:
+        l = un_lote(con, rec["lote_id"])
+        if l.get("disponible") is not None and l["disponible"] < 0:
+            con.execute("UPDATE lotes SET revisar=1, nota=TRIM(COALESCE(nota,'') || ' ' || ?) WHERE id=?",
+                        ("Bodega principal registró menos de lo que ya había pasado a bodega secundaria: revisar cantidades.", l["id"]))
     anotar(con, persona, "RECEPCION_BODEGA", "%s lote %s · %s %s%s" % (
         producto, v["lote"], v["cantidad"], v["unidad"], " · RECHAZADO" if v["rechazado"] else ""), rec["lote_id"])
     con.commit()
@@ -2402,11 +2407,14 @@ SELECT l.id, l.lote, l.origen, l.en_secundaria, l.agotado, l.revisar, l.nota, l.
        (SELECT COUNT(*) FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0) AS n_traslados,
        (SELECT COALESCE(SUM(s.cantidad), 0) FROM salidas_cocina s WHERE s.lote_id=l.id AND s.anulado=0) AS a_cocina,
        (SELECT GROUP_CONCAT(r.cantidad, '|') FROM recepciones r WHERE r.lote_id=l.id) AS cantidades,
-       (SELECT r.unidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1) AS unidad,
+       COALESCE((SELECT r.unidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1),
+                (SELECT t.unidad FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0 ORDER BY t.id DESC LIMIT 1)) AS unidad,
        (SELECT r.foto_lote FROM recepciones r WHERE r.lote_id=l.id AND r.foto_lote IS NOT NULL AND r.anulado=0
         ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1) AS foto_recepcion,
-       (SELECT a.empaque || '|' || a.contenido || '|' || a.unidad_contenido FROM recepciones r JOIN alias a ON a.id=r.alias_id
-        WHERE r.lote_id=l.id AND COALESCE(a.empaque,'')<>'' ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1) AS empaque_txt,
+       COALESCE((SELECT a.empaque || '|' || a.contenido || '|' || a.unidad_contenido FROM recepciones r JOIN alias a ON a.id=r.alias_id
+        WHERE r.lote_id=l.id AND COALESCE(a.empaque,'')<>'' ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1),
+                (SELECT a.empaque || '|' || a.contenido || '|' || a.unidad_contenido FROM alias a
+        WHERE a.ingrediente_id=l.ingrediente_id AND a.en_catalogo=1 AND COALESCE(a.empaque,'')<>'' ORDER BY a.id LIMIT 1)) AS empaque_txt,
        (SELECT COALESCE(SUM(o.cantidad), 0) FROM salidas_areas o WHERE o.lote_id=l.id AND o.anulado=0) AS otras_areas,
        (SELECT COALESCE(SUM(b.cantidad), 0) FROM bajas b WHERE b.lote_id=l.id AND b.lugar='secundaria' AND b.anulado=0) AS bajas_secundaria,
        l.principal_vacio, i.recipientes AS n_recipientes
@@ -2507,9 +2515,14 @@ def api_ingredientes():
     # Un ingrediente de proveedor sigue activo mientras su producto este en la lista de bodega principal
     # (si se elimina el producto, deja de aparecer en bodega secundaria, cocina y recetas).
     activos = {f[0] for f in con.execute("SELECT DISTINCT ingrediente_id FROM alias WHERE en_catalogo=1 AND ignorar=0 AND ingrediente_id IS NOT NULL")}
+    empaques = {f["ingrediente_id"]: dict(f) for f in con.execute(
+        "SELECT ingrediente_id, empaque, contenido, unidad_contenido FROM alias WHERE en_catalogo=1 AND COALESCE(empaque,'')<>'' "
+        "AND ingrediente_id IS NOT NULL ORDER BY id")}
     for ing in datos:
         ing["foto"] = fotos.get(ing["id"])
         ing["activo"] = ing["tipo"] != "lote" or ing["id"] in activos
+        e = empaques.get(ing["id"]) or {}
+        ing["empaque"], ing["contenido"], ing["unidad_contenido"] = e.get("empaque"), e.get("contenido"), e.get("unidad_contenido")
     return jsonify(datos)
 
 
@@ -2781,6 +2794,21 @@ def api_lote_manual():
     ing = con.execute("SELECT * FROM ingredientes WHERE id=?", (datos.get("ingrediente_id"),)).fetchone()
     if not ing:
         raise ErrorApi("Elige el ingrediente.")
+    # Lo que entra en este momento (asi cocina no puede tomar sin limite) y su caducidad
+    emp = con.execute("SELECT empaque, contenido, unidad_contenido FROM alias WHERE ingrediente_id=? AND en_catalogo=1 "
+                      "AND COALESCE(empaque,'')<>'' ORDER BY id LIMIT 1", (ing["id"],)).fetchone()
+    if emp:
+        cantidad = entero_paquetes(datos.get("cantidad"), emp["empaque"], "cuánto entra")
+        unidad = emp["empaque"]
+    else:
+        cantidad, unidad = numero(datos.get("cantidad")), ""
+        if not cantidad or cantidad <= 0:
+            raise ErrorApi("Escribe cuánto entra (solo el número).")
+    caducidad = str(datos.get("caducidad") or "")[:10]
+    try:
+        dt.date.fromisoformat(caducidad)
+    except ValueError:
+        raise ErrorApi("Escribe la fecha de caducidad que dice el empaque.")
     existente = con.execute("SELECT id FROM lotes WHERE ingrediente_id=? AND lote=?", (ing["id"], codigo)).fetchone()
     if existente:
         lote_id = existente["id"]
@@ -2792,21 +2820,34 @@ def api_lote_manual():
              ("No estaba en la lista de bodega principal. " + str(datos.get("nota") or "")).strip(), ahora(), persona))
         lote_id = cur.lastrowid
         anotar(con, persona, "LOTE_MANUAL", "%s lote %s (no estaba en la lista)" % (ing["nombre"], codigo), lote_id)
-    con.execute("UPDATE lotes SET en_secundaria=1, principal_vacio=1 WHERE id=?", (lote_id,))
+    con.execute("UPDATE lotes SET en_secundaria=1, principal_vacio=1, revisar=1, caducidad=COALESCE(NULLIF(caducidad,''), ?) WHERE id=?",
+                (caducidad, lote_id))
+    # Entra a bodega secundaria como un traslado; si lo anota cocina, cocina ya lo tomo.
+    con.execute("INSERT INTO traslados(lote_id,cantidad,unidad,fecha_hora,persona) VALUES(?,?,?,?,?)",
+                (lote_id, cantidad, unidad, ahora(), persona))
+    if datos.get("destino") == "cocina":
+        con.execute("INSERT INTO salidas_cocina(lote_id,cantidad,unidad,fecha_hora,persona) VALUES(?,?,?,?,?)",
+                    (lote_id, cantidad, unidad, ahora(), persona))
+    texto_cant = cantidad_texto(cantidad, {"empaque": emp["empaque"], "contenido": emp["contenido"],
+                                           "unidad_contenido": emp["unidad_contenido"]} if emp else {"unidad": unidad})
     donde = "en cocina" if datos.get("destino") == "cocina" else "en bodega secundaria"
     nota = str(datos.get("nota") or "").strip()
     comentario = (" Comentario: «%s»." % nota) if nota else ""
+    detalle = "%s, caduca el %s" % (texto_cant, dt.date.fromisoformat(caducidad).strftime("%d/%m/%Y"))
     for area_aviso, texto in (
-            ("bodega", "%s anotó a mano el lote %s de %s %s porque no aparecía en bodega principal. "
-                       "Revisa si falta registrar su recepción.%s" % (persona, codigo, ing["nombre"], donde, comentario)),
-            ("produccion", "%s anotó a mano el lote %s de %s %s porque no aparecía en la lista. "
-                           "Verifica qué pasó.%s" % (persona, codigo, ing["nombre"], donde, comentario))):
+            ("bodega", "%s anotó a mano el lote %s de %s %s (%s) porque no aparecía en bodega principal. "
+                       "Registra su recepción con el mismo código y la cantidad total que llegó.%s"
+             % (persona, codigo, ing["nombre"], donde, detalle, comentario)),
+            ("produccion", "%s anotó a mano el lote %s de %s %s (%s) porque no aparecía en la lista. "
+                           "Verifica qué pasó.%s" % (persona, codigo, ing["nombre"], donde, detalle, comentario))):
         con.execute("INSERT INTO avisos(area,lote_id,texto,creado_en,creado_por) VALUES(?,?,?,?,?)",
                     (area_aviso, lote_id, texto, ahora(), persona))
     anteriores = []
     if datos.get("destino") == "cocina":
         if abrir_lote(con, un_lote(con, lote_id), persona):
             anteriores = anteriores_de(con, [(lote_id, ing["id"], 1)])
+        if (un_lote(con, lote_id).get("disponible_cocina") or 0) <= 0:
+            con.execute("UPDATE lotes SET en_secundaria=0 WHERE id=?", (lote_id,))     # cocina se lo llevo todo
     con.commit()
     return jsonify(ok=True, lote_id=lote_id, anteriores=anteriores)
 

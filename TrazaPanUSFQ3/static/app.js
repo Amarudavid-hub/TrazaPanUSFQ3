@@ -385,18 +385,25 @@ async function loteManual(ing, destino) {
   const codigo = h('input', { type: 'text', autocapitalize: 'characters', autocomplete: 'off' });
   const nota = h('input', { type: 'text', placeholder: 'Opcional' });
   const foto = campoFoto();
+  let cant = '';
+  const { campo: campoCant, eq } = campoEmpaques(ing, '', (v) => { cant = v; }, 'ej. 2');
+  const caducidad = h('input', { type: 'date' });
   const datos = await modal('Lote que no está en la lista',
     h('div', null,
-      h('div', { class: 'nota' }, 'Úsalo solo si de verdad no aparece. Queda marcado «por revisar» hasta que bodega principal lo registre.'),
+      h('div', { class: 'nota' }, 'Úsalo solo si de verdad no aparece. Queda «por revisar» hasta que bodega principal registre la recepción con el mismo código.'),
       h('p', null, 'Ingrediente: ', h('b', null, ing.nombre)),
       h('label', null, 'Código de lote, exactamente como está en el empaque'), codigo,
+      h('label', null, ing.empaque ? cuantos(ing.empaque) + ' entran ahora? (solo lo que tienes aquí)' : '¿Cuánto entra ahora? (solo lo que tienes aquí)'), campoCant, eq,
+      h('label', null, 'Fecha de caducidad (la del empaque)'), caducidad,
       h('label', null, 'Foto del empaque donde se ve el lote'), foto.el,
       h('label', null, 'Comentario'), nota),
-    [{ texto: 'Registrar', clase: 'principal', valor: () => ({ lote: codigo.value.trim(), nota: nota.value.trim(), archivo: foto.archivo }) },
+    [{ texto: 'Registrar', clase: 'principal', valor: () => ({ lote: codigo.value.trim(), nota: nota.value.trim(), archivo: foto.archivo,
+      cantidad: cant, caducidad: caducidad.value }) },
       { texto: 'Cancelar', valor: null }]);
   foto.apagar();
   if (!datos) return false;
-  const r = await intentar(() => api('/lotes/manual', { ingrediente_id: ing.id, lote: datos.lote, nota: datos.nota, destino }));
+  const r = await intentar(() => api('/lotes/manual', { ingrediente_id: ing.id, lote: datos.lote, nota: datos.nota, destino,
+    cantidad: datos.cantidad, caducidad: datos.caducidad }));
   if (!r) return false;
   if (datos.archivo) {
     const blob = await reducirFoto(datos.archivo);
