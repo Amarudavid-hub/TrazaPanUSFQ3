@@ -962,6 +962,12 @@ def respaldo_diario():
 # ----------------------------------------------------------------------------
 # 2. Utilidades
 # ----------------------------------------------------------------------------
+# Hora de Ecuador aunque la app corra en un equipo o servidor con otra zona horaria (por ejemplo, en la nube).
+if hasattr(time, "tzset"):
+    os.environ["TZ"] = os.environ.get("TRAZAPAN_TZ", "America/Guayaquil")
+    time.tzset()
+
+
 def ahora():
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1377,7 +1383,7 @@ def cantidad_texto(n, lote):
         total, u = n * lote["contenido"], lote["unidad_contenido"]
         if u in ("g", "ml") and total >= 1000:
             total, u = total / 1000, {"g": "kg", "ml": "lt"}[u]
-        return "%s %s (%s %s)" % (fmt(n), plural_empaque(lote["empaque"]) if n != 1 else lote["empaque"].lower(), fmt(total), u)
+        return "%s %s (%s %s)" % (fmt(n), plural_empaque(lote["empaque"]) if n != 1 else lote["empaque"].lower().replace("bidon", "bidón"), fmt(total), u)
     return ("%s %s" % (fmt(n), lote.get("unidad") or "")).strip()
 
 
@@ -2182,6 +2188,13 @@ def api_recepcion_nueva():
         if l.get("disponible") is not None and l["disponible"] < 0:
             con.execute("UPDATE lotes SET revisar=1, nota=TRIM(COALESCE(nota,'') || ' ' || ?) WHERE id=?",
                         ("Bodega principal registró menos de lo que ya había pasado a bodega secundaria: revisar cantidades.", l["id"]))
+        if l.get("disponible") is not None and l["disponible"] <= 0:
+            con.execute("UPDATE lotes SET principal_vacio=1 WHERE id=?", (l["id"],))     # todo ya paso a bodega secundaria
+    if d.get("aviso_id"):        # se registro desde el aviso de un lote anotado a mano
+        if rec["lote_id"] and (un_lote(con, rec["lote_id"]).get("disponible") or 0) >= 0:
+            con.execute("UPDATE lotes SET revisar=0 WHERE id=?", (rec["lote_id"],))
+        con.execute("UPDATE avisos SET resuelto_en=?, resuelto_por=?, comentario=? WHERE id=? AND resuelto_en IS NULL",
+                    (ahora(), persona, "Se registró la recepción (%s %s en total)." % (v["cantidad"], v["unidad"].lower()), int(d["aviso_id"])))
     anotar(con, persona, "RECEPCION_BODEGA", "%s lote %s · %s %s%s" % (
         producto, v["lote"], v["cantidad"], v["unidad"], " · RECHAZADO" if v["rechazado"] else ""), rec["lote_id"])
     con.commit()
@@ -2834,12 +2847,16 @@ def api_lote_manual():
     nota = str(datos.get("nota") or "").strip()
     comentario = (" Comentario: «%s»." % nota) if nota else ""
     detalle = "%s, caduca el %s" % (texto_cant, dt.date.fromisoformat(caducidad).strftime("%d/%m/%Y"))
-    for area_aviso, texto in (
-            ("bodega", "%s anotó a mano el lote %s de %s %s (%s) porque no aparecía en bodega principal. "
-                       "Registra su recepción con el mismo código y la cantidad total que llegó.%s"
-             % (persona, codigo, ing["nombre"], donde, detalle, comentario)),
-            ("produccion", "%s anotó a mano el lote %s de %s %s (%s) porque no aparecía en la lista. "
-                           "Verifica qué pasó.%s" % (persona, codigo, ing["nombre"], donde, detalle, comentario))):
+    # Bodega secundaria no lo encontro -> avisa a bodega principal. Cocina no lo encontro -> avisa a bodega secundaria.
+    if datos.get("destino") == "cocina":
+        avisos = [("produccion", "%s anotó a mano el lote %s de %s (%s) porque no aparecía en bodega secundaria. "
+                                 "Verifica de dónde salió; si tampoco está en bodega principal, avisa para que registren su recepción.%s"
+                   % (persona, codigo, ing["nombre"], detalle, comentario))]
+    else:
+        avisos = [("bodega", "%s anotó a mano el lote %s de %s en bodega secundaria (%s) porque no aparecía en bodega principal. "
+                             "Registra su recepción con el mismo código y la cantidad total que llegó.%s"
+                   % (persona, codigo, ing["nombre"], detalle, comentario))]
+    for area_aviso, texto in avisos:
         con.execute("INSERT INTO avisos(area,lote_id,texto,creado_en,creado_por) VALUES(?,?,?,?,?)",
                     (area_aviso, lote_id, texto, ahora(), persona))
     anteriores = []
@@ -4058,10 +4075,19 @@ def api_traza_ingrediente():
 def api_avisos():
     """Avisos sin revisar de un área (bodega o produccion)."""
     area_aviso = request.args.get("area") or ""
-    return jsonify(filas(db().execute(
-        """SELECT a.id, a.texto, a.creado_en, a.creado_por, a.lote_id, l.lote, l.foto, i.nombre AS ingrediente
+    con = db()
+    datos = filas(con.execute(
+        """SELECT a.id, a.texto, a.creado_en, a.creado_por, a.lote_id, l.lote, l.foto, l.origen, l.caducidad, i.nombre AS ingrediente,
+                  (SELECT COALESCE(SUM(t.cantidad),0) FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0) AS trasladado,
+                  EXISTS(SELECT 1 FROM recepciones r WHERE r.lote_id=l.id AND r.anulado=0) AS tiene_recepcion,
+                  (SELECT al.producto FROM alias al WHERE al.ingrediente_id=l.ingrediente_id AND al.en_catalogo=1 AND al.ignorar=0 ORDER BY al.id LIMIT 1) AS producto,
+                  (SELECT al.empaque FROM alias al WHERE al.ingrediente_id=l.ingrediente_id AND al.en_catalogo=1 AND al.ignorar=0 ORDER BY al.id LIMIT 1) AS empaque
            FROM avisos a LEFT JOIN lotes l ON l.id=a.lote_id LEFT JOIN ingredientes i ON i.id=l.ingrediente_id
-           WHERE a.area=? AND a.resuelto_en IS NULL ORDER BY a.id DESC""", (area_aviso,))))
+           WHERE a.area=? AND a.resuelto_en IS NULL ORDER BY a.id DESC""", (area_aviso,)))
+    for a in datos:
+        # Lote anotado a mano en bodega secundaria que bodega principal todavia no registro: se resuelve registrando la recepcion
+        a["registrar_recepcion"] = bool(area_aviso == "bodega" and a["lote_id"] and a["origen"] == "manual" and not a["tiene_recepcion"])
+    return jsonify(datos)
 
 
 @app.post("/api/avisos/<int:aviso_id>/revisado")

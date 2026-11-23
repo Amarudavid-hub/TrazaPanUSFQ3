@@ -412,7 +412,7 @@ async function loteManual(ing, destino) {
       if (!resp.ok) throw new Error('El lote se registró, pero la foto no se pudo guardar.');
     });
   }
-  avisar('Lote registrado y marcado por revisar. Se avisó a bodega principal y a producción.', 'bien');
+  avisar('Lote registrado y marcado por revisar. Se avisó a ' + (destino === 'cocina' ? 'bodega secundaria.' : 'bodega principal.'), 'bien');
   revisarAvisos(true);
   await preguntarAnteriores(r.anteriores);
   return true;
@@ -506,13 +506,20 @@ async function verAvisos() {
         h('p', { style: 'margin-top:0' }, a.texto),
         h('div', { class: 'chico suave' }, hora(a.creado_en)),
         a.foto ? h('p', null, h('a', { href: '/fotos/' + a.foto, target: '_blank' }, 'Ver foto del empaque')) : null,
-        resp,
-        h('button', { class: 'boton ok', type: 'button', style: 'margin-top:.5rem', onclick: () => intentar(async () => {
-          await api('/avisos/' + a.id + '/revisado', { comentario: resp.value.trim() });
-          avisar('Aviso marcado como revisado', 'bien');
-          await revisarAvisos();
-          dibujar();
-        }) }, 'Ya lo revisé'));
+        a.registrar_recepcion ? [
+          h('p', { style: 'margin:.6rem 0 .3rem' }, h('b', null, '¿Hay más de este lote en bodega principal?')),
+          h('div', { class: 'acciones-aviso' },
+            h('button', { class: 'boton principal', type: 'button', onclick: () => intentar(async () => {
+              if (await registrarDesdeAviso(a, true)) { await revisarAvisos(); dibujar(); } }) }, 'Sí, hay más'),
+            h('button', { class: 'boton', type: 'button', onclick: () => intentar(async () => {
+              if (await registrarDesdeAviso(a, false)) { await revisarAvisos(); dibujar(); } }) }, 'No, solo llegó eso'))]
+          : [resp,
+            h('button', { class: 'boton ok', type: 'button', style: 'margin-top:.5rem', onclick: () => intentar(async () => {
+              await api('/avisos/' + a.id + '/revisado', { comentario: resp.value.trim() });
+              avisar('Aviso marcado como revisado', 'bien');
+              await revisarAvisos();
+              dibujar();
+            }) }, 'Ya lo revisé')]);
     }) : [h('p', { class: 'suave' }, 'No hay avisos pendientes.')]));
   };
   await revisarAvisos();
@@ -819,7 +826,41 @@ function formRecepcion(cat, ini, editar) {
     revisar();
     if (mismoProducto) c.lote.focus();
   };
-  return { el, leer, limpiar, fotos };
+  const elegirProducto = (nombre) => { const p = cat.productos.find((x) => x.producto === nombre); if (p && prod) prod.elegir(p); return p; };
+  return { el, leer, limpiar, fotos, campos: c, elegirProducto };
+}
+
+// Desde el aviso de un lote anotado a mano en bodega secundaria: bodega principal registra la recepción.
+// hayMas = quedan más en bodega principal (se escribe el total que llegó); si no, el total es lo que ya pasó a secundaria.
+async function registrarDesdeAviso(a, hayMas) {
+  const cat = await api('/bodega/catalogo');
+  const f = formRecepcion(cat, { lote_texto: a.lote, caducidad: a.caducidad, fecha_ingreso: cat.hoy });
+  const p = f.elegirProducto(a.producto);
+  const ya = Number(a.trasladado) || 0;
+  const e = p && p.empaque ? p : null;
+  const cuanto = (n) => (e ? cantidadLote(n, e) : num(n));
+  f.campos.lote.disabled = true;           // mismo código que anotó bodega secundaria
+  const info = h('div', { class: 'nota' });
+  const pintar = () => {
+    const total = Number(f.campos.cantidad.value);
+    info.replaceChildren(...(hayMas
+      ? [h('div', null, 'Ya pasaron a bodega secundaria: ', h('b', null, cuanto(ya)), '.'),
+        f.campos.cantidad.value ? (total < ya ? h('div', { style: 'color:var(--alerta)' }, 'El total no puede ser menor que lo que ya pasó.')
+          : h('div', null, 'Quedan en bodega principal: ', h('b', null, cuanto(total - ya)), '.')) : h('div', { class: 'chico' }, 'Escribe abajo cuántos llegaron en total.')]
+      : [h('div', null, 'Llegaron solo los que ya están en bodega secundaria: ', h('b', null, cuanto(ya)), '. En bodega principal no queda nada.')]));
+  };
+  if (!hayMas) { f.campos.cantidad.value = String(ya); f.campos.cantidad.disabled = true; f.campos.cantidad.dispatchEvent(new Event('input')); }
+  f.campos.cantidad.addEventListener('input', pintar);
+  pintar();
+  const datos = await modal('Registrar la recepción del lote ' + a.lote, h('div', null, info, f.el),
+    [{ texto: 'Guardar recepción', clase: 'principal', valor: () => f.leer() }, { texto: 'Cancelar', valor: null }]);
+  Object.values(f.fotos).forEach((x) => x.apagar());
+  if (!datos) return false;
+  if (hayMas && Number(datos.cantidad) <= ya) throw new Error('Si hay más en bodega principal, el total tiene que ser mayor que ' + cuanto(ya) + '.');
+  const r = await api('/recepciones', Object.assign(datos, { aviso_id: a.id }));
+  await subirFotosRecepcion(r.id, f.fotos);
+  avisar('Recepción registrada · lote ' + r.lote_texto, 'bien');
+  return true;
 }
 
 // Corregir una recepción de bodega principal (fecha, proveedor, cantidad, caducidad, etc.). El motivo queda en el historial.
