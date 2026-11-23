@@ -480,3 +480,9 @@ tr.fuera-pagina { display: none; }
 .fotos-recepcion label { display: block; }
 .error-modal { background: var(--alerta-claro); color: #7a241b; border-radius: 10px; padding: .6rem .8rem; margin: .8rem 0 .2rem; font-size: .92rem; font-weight: 600; }
 .error-modal[hidden] { display: none; }
+/* Inventario unido al semáforo: lotes por producto, cada uno con su color y sus botones */
+.inv-titulo .chico { margin-left: auto; white-space: nowrap; }
+.inv-grupo .lote { margin: .45rem 0 0; }
+.segmento.varias { flex-wrap: wrap; }
+.segmento.varias button { flex: 1 1 30%; }
+.segmento.varias.pares button { flex: 1 1 40%; }

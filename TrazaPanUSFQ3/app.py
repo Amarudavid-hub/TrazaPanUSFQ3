@@ -400,6 +400,10 @@ def migrar(con):
     con.execute("""CREATE TABLE IF NOT EXISTS inventario_lotes(
         id INTEGER PRIMARY KEY, inventario_id INTEGER NOT NULL REFERENCES inventarios(id), lote_id INTEGER NOT NULL REFERENCES lotes(id),
         esta INTEGER NOT NULL, reabierto_en TEXT, reabierto_por TEXT)""")
+    # tipo 'suelto': un solo lote dado de baja como «ya no está» fuera del inventario del mes (no cuenta como inventario hecho).
+    if "tipo" not in {f["name"] for f in con.execute("PRAGMA table_info(inventarios)")}:
+        con.execute("ALTER TABLE inventarios ADD COLUMN tipo TEXT DEFAULT ''")
+        con.execute("ALTER TABLE inventarios ADD COLUMN nota TEXT DEFAULT ''")
     # Version 19: panes con reposo (la masa se hace un dia y se termina al siguiente).
     #   productos.lleva_reposo: muestra el boton "Masa lista"; receta.despues_reposo: renglon que se agrega al dia
     #   siguiente (por ejemplo el relleno); producciones.masa_lista_en: desde ahi la masa ya no recibe lotes nuevos.
@@ -1787,9 +1791,10 @@ def api_inventarios_xlsx():
     hoja.title = "Inventarios"
     invs = filas(con.execute("SELECT * FROM inventarios ORDER BY id"))
     tabla(hoja, "Inventarios realizados",
-          ["FECHA Y HORA", "BODEGA", "REGISTRÓ", "LOTES REVISADOS", "SIGUEN EN BODEGA", "YA NO ESTABAN (SE CERRARON)"],
-          [[fecha_hora(i["fecha_hora"]), lugares.get(i["lugar"], i["lugar"]), i["persona"], i["revisados"], i["revisados"] - i["cerrados"], i["cerrados"]]
-           for i in invs], [17, 20, 18, 12, 12, 16])
+          ["FECHA Y HORA", "BODEGA", "REGISTRÓ", "TIPO", "LOTES REVISADOS", "SIGUEN EN BODEGA", "YA NO ESTABAN (SE CERRARON)", "COMENTARIO"],
+          [[fecha_hora(i["fecha_hora"]), lugares.get(i["lugar"], i["lugar"]), i["persona"],
+            "BAJA: YA NO ESTÁ" if i["tipo"] == "suelto" else "INVENTARIO", i["revisados"], i["revisados"] - i["cerrados"], i["cerrados"], i["nota"] or None]
+           for i in invs], [17, 20, 18, 18, 12, 12, 16, 30])
     detalle = filas(con.execute(
         """SELECT inv.fecha_hora, inv.lugar, inv.persona, il.esta, il.reabierto_en, il.reabierto_por, l.lote, i.nombre AS ingrediente,
                   (SELECT a.producto FROM recepciones r JOIN alias a ON a.id=r.alias_id WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS producto,
@@ -1851,7 +1856,7 @@ LUGARES_INVENTARIO = {"principal": "bodega principal", "secundaria": "bodega sec
 
 
 def ultimo_inventario(con, lugar):
-    fila = con.execute("SELECT * FROM inventarios WHERE lugar=? ORDER BY id DESC LIMIT 1", (lugar,)).fetchone()
+    fila = con.execute("SELECT * FROM inventarios WHERE lugar=? AND COALESCE(tipo,'')='' ORDER BY id DESC LIMIT 1", (lugar,)).fetchone()
     if not fila:
         return None
     d = dict(fila)
@@ -2052,6 +2057,30 @@ def api_salida_anular(salida_id):
 
 
 MOTIVOS_BAJA = ("CADUCADO", "CONTAMINADO")
+MOTIVO_NO_ESTA = "NO_ESTA"
+
+
+def baja_no_esta(con, lote_id, lugar, persona, comentario):
+    """«Ya no está»: el lote sale de esa bodega sin esperar al inventario del mes. Se guarda como el cierre de un
+    inventario de un solo lote (tipo 'suelto'): sale en el Historial y se deshace con «Se marcó por error»."""
+    if lugar not in LUGARES_INVENTARIO:
+        raise ErrorApi("«Ya no está» se usa en bodega principal o en bodega secundaria.")
+    donde = LUGARES_INVENTARIO[lugar]
+    lote = un_lote(con, lote_id)
+    if lote["id"] not in {l["id"] for l in listar_lotes(con, lugar, limite=5000)}:
+        raise ErrorApi("El lote %s ya no está en %s." % (lote["lote"], donde))
+    quedaba = max(round(saldo_al(con, lote["id"], lugar), 3), 0)
+    inv = con.execute("INSERT INTO inventarios(lugar,fecha_hora,persona,revisados,cerrados,tipo,nota) VALUES(?,?,?,1,1,'suelto',?)",
+                      (lugar, ahora(), persona, comentario)).lastrowid
+    con.execute("INSERT INTO inventario_lotes(inventario_id,lote_id,esta) VALUES(?,?,0)", (inv, lote["id"]))
+    cerrar_saldo(con, lote["id"], lugar, inv, persona)
+    con.execute("UPDATE lotes SET principal_vacio=1 WHERE id=?" if lugar == "principal"
+                else "UPDATE lotes SET en_secundaria=0 WHERE id=?", (lote["id"],))
+    anotar(con, persona, "BAJA", "%s lote %s: ya no está en %s%s%s" % (
+        lote["ingrediente"], lote["lote"], donde,
+        " (la app contaba %s)" % cantidad_texto(quedaba, lote) if quedaba else "", ": " + comentario if comentario else ""), lote["id"])
+    con.commit()
+    return jsonify(ok=True, vacio=True, no_esta=True)
 
 
 def dia_texto(fecha):
@@ -2069,9 +2098,11 @@ def api_baja():
     con = db()
     lugar = d.get("lugar")
     motivo = str(d.get("motivo") or "").upper()
-    if motivo not in MOTIVOS_BAJA:
-        raise ErrorApi("Elige el motivo: caducado o contaminado.")
     comentario = " ".join(str(d.get("comentario") or "").split())
+    if motivo == MOTIVO_NO_ESTA:
+        return baja_no_esta(con, d.get("lote_id"), lugar, persona, comentario)
+    if motivo not in MOTIVOS_BAJA:
+        raise ErrorApi("Elige el motivo.")
     lote = un_lote(con, d.get("lote_id"))
     unidad = lote["unidad"] or ""
     cantidad = numero(d.get("cantidad")) if str(d.get("cantidad") or "").strip() else None

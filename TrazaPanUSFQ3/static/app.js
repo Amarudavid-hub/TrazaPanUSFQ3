@@ -161,34 +161,45 @@ function semaforo(l) {
   return h('span', { class: 'semaforo ' + l.semaforo }, h('i'), texto);
 }
 
-// Dar de baja un lote (o parte) por caducado o contaminado. lugar: principal, secundaria o cocina.
+// Dar de baja un lote (o parte) por caducado o contaminado, o entero porque ya no está. lugar: principal, secundaria o cocina.
 // disponible: lo que queda en ese lugar (se propone darlo todo de baja); en cocina la cantidad es opcional.
 async function darDeBaja(l, lugar, disponible) {
   const u = unidadDe(l, 2);
-  // En bodega secundaria también: "Registrado por error" (el lote no llegó; vuelve a bodega principal).
-  const opciones = [['CADUCADO', 'Caducado'], ['CONTAMINADO', 'Contaminado']].concat(lugar === 'secundaria' ? [['ERROR', 'Registrado por error']] : []);
-  let bloqueCantidad = null, notaError = null;
+  const nombres = { principal: 'bodega principal', secundaria: 'bodega secundaria', cocina: 'cocina' };
+  // En las bodegas: "Ya no está" (el lote sale de la lista). En bodega secundaria también: "Registrado por error" (vuelve a bodega principal).
+  const opciones = [['CADUCADO', 'Caducado'], ['CONTAMINADO', 'Contaminado']]
+    .concat(lugar !== 'cocina' ? [['NO_ESTA', 'Ya no está']] : [])
+    .concat(lugar === 'secundaria' ? [['ERROR', 'Registrado por error']] : []);
+  let bloqueCantidad = null, bloqueComentario = null, notaError = null, notaNoEsta = null;
   const motivo = segmento(opciones, l.semaforo === 'rojo' ? 'CADUCADO' : '', (v) => {
-    if (bloqueCantidad) bloqueCantidad.hidden = v === 'ERROR';
+    if (bloqueCantidad) bloqueCantidad.hidden = v === 'ERROR' || v === 'NO_ESTA';
+    if (bloqueComentario) bloqueComentario.hidden = v === 'ERROR';
     if (notaError) notaError.hidden = v !== 'ERROR';
+    if (notaNoEsta) notaNoEsta.hidden = v !== 'NO_ESTA';
   });
+  if (opciones.length > 2) motivo.el.classList.add('varias');
+  if (opciones.length === 4) motivo.el.classList.add('pares');
   const cantidad = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: disponible != null ? num(Math.max(disponible, 0)) : '',
     placeholder: lugar === 'cocina' ? 'Opcional' : 'Solo números',
     oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; } });
   const comentario = h('input', { type: 'text', placeholder: 'Qué pasó (opcional)' });
-  const nombres = { principal: 'bodega principal', secundaria: 'bodega secundaria', cocina: 'cocina' };
+  const contaba = lugar === 'principal' ? l.disponible : lugar === 'secundaria' ? l.disponible_cocina : null;
   const d = await modal('Dar de baja', h('div', null,
     h('p', { style: 'margin-top:0' }, h('b', null, l.ingrediente), ' | ', h('b', { class: 'mono' }, l.lote), ' ', semaforo(l)),
     h('label', null, 'Motivo'), motivo.el,
     notaError = h('p', { class: 'nota', hidden: true }, 'El lote sale de bodega secundaria y vuelve a quedar en bodega principal, como si nunca hubiera pasado.'),
+    notaNoEsta = h('p', { class: 'nota', hidden: true }, 'El lote sale de la lista de ' + nombres[lugar] + '.',
+      contaba > 0 ? [' La app contaba ', h('b', null, cantidadLote(contaba, l)), ', que dejan de contarse.'] : null,
+      ' Si fue un error, se vuelve a poner desde Historial.'),
     bloqueCantidad = h('div', null,
       h('label', null, '¿Cuántas ' + u + ' se sacan de ' + nombres[lugar] + '?'), cantidad,
-      disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + cantidadLote(Math.max(disponible, 0), l) + '.') : null,
-      h('label', null, 'Comentario'), comentario)),
+      disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + cantidadLote(Math.max(disponible, 0), l) + '.') : null),
+    bloqueComentario = h('div', null, h('label', null, 'Comentario'), comentario)),
   [{ texto: 'Dar de baja', clase: 'peligro-lleno', accion: async () => {
       const datos = { lote_id: l.id, lugar, motivo: motivo.valor, cantidad: cantidad.value.trim(), comentario: comentario.value.trim() };
       if (!datos.motivo) throw new Error('Elige el motivo.');
       if (datos.motivo === 'ERROR') { await api('/secundaria/devolver', { lote_id: l.id }); return { devuelto: true }; }
+      if (datos.motivo === 'NO_ESTA') datos.cantidad = '';
       return api('/bajas', datos);
     } },
     { texto: 'Cancelar', valor: null }]);
@@ -197,8 +208,7 @@ async function darDeBaja(l, lugar, disponible) {
     avisar('Ingreso del lote ' + l.lote + ' anulado: vuelve a bodega principal', 'bien');
     return true;
   }
-  const r = d;
-  avisar('Lote ' + l.lote + ' dado de baja' + (r.vacio ? '' : ' (parcial)'), 'bien');
+  avisar(d.no_esta ? 'Lote ' + l.lote + ': ya no está en ' + nombres[lugar] : 'Lote ' + l.lote + ' dado de baja' + (d.vacio ? '' : ' (parcial)'), 'bien');
   return true;
 }
 
@@ -218,7 +228,7 @@ function tarjetaSemaforo(l, nombre, disponible, acciones, foto) {
   return h('div', { class: 'lote borde-' + (l.semaforo || 'sin') },
     foto !== undefined ? fotoProducto(foto, nombre, 'en-lote') : null,
     h('div', { class: 'datos' },
-      h('div', { class: 'titulo-lote' }, h('b', null, nombre), h('span', { class: 'separador' }, '|'), h('b', { class: 'mono' }, l.lote)),
+      h('div', { class: 'titulo-lote' }, nombre ? [h('b', null, nombre), h('span', { class: 'separador' }, '|')] : null, h('b', { class: 'mono' }, l.lote)),
       h('div', { class: 'chico' }, disponible === false ? h('span', { class: 'suave' }, l.fecha_ingreso ? 'Ingresó ' + dia(l.fecha_ingreso) : '')
         : disponible != null ? ['Quedan ', h('b', null, cantidadLote(Math.max(disponible, 0), l))] : h('span', { class: 'suave' }, 'Cantidad sin registrar'),
         l.proveedor ? h('span', { class: 'suave' }, (disponible === false && !l.fecha_ingreso ? '' : ' · ') + l.proveedor) : null),
@@ -1064,8 +1074,8 @@ async function vistaBodega() {
 // Bodega principal registra lo que pasa a pastelería y carnicería (lo de panadería lo registra bodega secundaria).
 // Pestañas: pasar a otra área (producto → lote → área y cantidad), semáforo de caducidad e historial.
 // ------------------------------------------------------------------ inventario
-// Cada mes se revisa la bodega: todos los lotes empiezan como «Está»; los que se tocan quedan como «Ya no está»
-// y al guardar salen de esa bodega. Así la lista no crece para siempre (bodega principal no anota lo que va a otras áreas).
+// Cada mes se revisa la bodega con el semáforo de caducidad a la vista. Los lotes que ya no están se dan de baja
+// («Ya no está») y salen de esa bodega: así la lista no crece para siempre.
 function textoUltimoInventario(ult, diasInv) {
   if (!ult) return h('div', { class: 'nota' }, 'Todavía no se ha hecho ningún inventario de esta bodega.');
   const toca = ult.dias >= diasInv;
@@ -1073,57 +1083,88 @@ function textoUltimoInventario(ult, diasInv) {
     ' (' + (ult.dias === 0 ? 'hoy' : 'hace ' + ult.dias + ' día' + (ult.dias === 1 ? '' : 's')) + ')', toca ? '. Ya toca hacer el de este mes.' : '');
 }
 
-async function panelInventario(lugar, caja, volver) {
-  const [datos, ings] = await Promise.all([api('/inventarios?lugar=' + lugar), api('/ingredientes')]);
-  const cat = lugar === 'principal' ? await api('/bodega/catalogo') : null;
+// Número de lotes caducados junto al nombre de la pestaña Inventario.
+function insigniaRojos() {
+  const el = h('span', { class: 'num rojo', hidden: true });
+  return { el, poner: (lotes) => {
+    const n = lotes.filter((l) => l.semaforo === 'rojo').length;
+    el.hidden = !n; el.textContent = n; el.title = n + ' caducado(s)';
+    const boton = el.closest('button'); if (boton) boton.classList.toggle('con-rojo', !!n);
+  } };
+}
+
+// Inventario de una bodega: los lotes agrupados por producto, cada uno con su semáforo de caducidad y sus botones.
+// Un lote que ya no está se da de baja con «Ya no está». Al terminar de revisar la bodega se guarda el inventario.
+// opc.irHistorial: a dónde ir al guardar · opc.alCargar(lotes): cada vez que se lee la lista.
+async function panelInventario(lugar, caja, opc) {
+  opc = opc || {};
+  const nombreLugar = lugar === 'principal' ? 'bodega principal' : 'bodega secundaria';
+  const [ings, cat] = await Promise.all([api('/ingredientes'), lugar === 'principal' ? api('/bodega/catalogo') : null]);
   const nombreDe = (l) => l.producto_bodega || l.ingrediente;      // el mismo nombre que en bodega principal
   const fotoDe = (l) => (cat ? (cat.productos.find((p) => p.producto === l.producto_bodega) || {}).foto : null)
     || (ings.find((i) => i.id === l.ingrediente_id) || {}).foto || null;
-  const noEsta = new Set();
+  const urgencia = (l) => (l.semaforo === 'rojo' ? 0 : l.semaforo === 'amarillo' ? 1 : 2);
+  let datos = { lotes: [] };
   let filtro = '';
-  const grupos = new Map();
-  datos.lotes.forEach((l) => { const n = nombreDe(l); grupos.set(n, (grupos.get(n) || []).concat(l)); });
-  const nombres = [...grupos.keys()].sort((a, b) => a.localeCompare(b));
+  let grupos = [];                      // [nombre, lotes]: primero los productos con algo caducado o por caducar
   const lista = h('div', null);
-  const botonGuardar = h('button', { class: 'boton principal', type: 'button', onclick: () => guardar() });
-  const contar = () => {
-    botonGuardar.textContent = 'Guardar inventario · ' + datos.lotes.length + ' lote' + (datos.lotes.length === 1 ? '' : 's')
-      + (noEsta.size ? ' · ' + noEsta.size + ' ya no está' + (noEsta.size === 1 ? '' : 'n') : '');
+  const buscador = h('input', { type: 'search', placeholder: 'Buscar producto o lote', oninput: (e) => { filtro = e.target.value; pintarLista(); } });
+  const cargar = async () => {
+    const y = window.scrollY;
+    datos = await api('/inventarios?lugar=' + lugar);
+    const mapa = new Map();
+    ordenarSemaforo(datos.lotes).forEach((l) => { const n = nombreDe(l); mapa.set(n, (mapa.get(n) || []).concat(l)); });
+    const peor = (lotes) => Math.min(...lotes.map(urgencia));
+    grupos = [...mapa.entries()].sort((a, b) => peor(a[1]) - peor(b[1]) || a[0].localeCompare(b[0]));
+    if (opc.alCargar) opc.alCargar(datos.lotes);
+    pintarTodo();
+    window.scrollTo(0, y);
   };
-  const filaLote = (l) => {
-    const fuera = noEsta.has(l.id);
-    return h('button', { type: 'button', class: 'inv-lote ' + (fuera ? 'no-esta' : 'esta'), onclick: () => {
-      fuera ? noEsta.delete(l.id) : noEsta.add(l.id); pintarLista(); contar(); } },
-      h('span', { class: 'inv-marca', 'aria-hidden': 'true' }, fuera ? '✕' : '✓'),
-      h('span', { class: 'inv-datos' }, h('b', { class: 'mono' }, l.lote),
-        h('span', { class: 'chico suave' }, [l.proveedor, l.fecha_ingreso ? 'ingresó ' + dia(l.fecha_ingreso) : null].filter(Boolean).join(' · '))),
-      semaforo(l), h('span', { class: 'inv-estado' }, fuera ? 'Ya no está' : 'Está'));
-  };
+  const botones = (l) => (lugar === 'principal' ? [
+    h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => { if (await editarIngresoLote(l)) await cargar(); }) }, 'Editar ingreso'),
+    h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => { if (await darDeBaja(l, 'principal', null)) await cargar(); }) }, 'Dar de baja')]
+    : [l.semaforo ? null : h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => { if (await editarIngresoLote(l)) await cargar(); }) }, 'Poner caducidad'),
+      h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => { if (await darDeBaja(l, 'secundaria', l.disponible_cocina)) await cargar(); }) }, 'Dar de baja')]);
   const pintarLista = () => {
     const n = normal(filtro);
-    const visibles = nombres.filter((nom) => !n || normal(nom + ' ' + grupos.get(nom).map((l) => l.lote).join(' ')).includes(n));
-    llenar(lista, visibles.length ? visibles.map((nom) => h('div', { class: 'tarjeta inv-grupo' },
-      h('div', { class: 'inv-titulo' }, fotoProducto(fotoDe(grupos.get(nom)[0]), nom, 'en-lote'), h('b', null, nom)),
-      grupos.get(nom).map(filaLote))) : h('p', { class: 'suave' }, 'Ningún producto coincide con la búsqueda.'));
+    // Si lo que se busca es el producto, salen todos sus lotes; si es un lote o proveedor, solo los que coinciden.
+    const visibles = grupos.map(([nom, lotes]) => [nom, !n || normal(nom).includes(n) ? lotes
+      : lotes.filter((l) => normal([l.ingrediente, l.lote, l.proveedor].join(' ')).includes(n))]).filter(([, lotes]) => lotes.length);
+    llenar(lista, visibles.length ? visibles.map(([nom, lotes]) => h('div', { class: 'tarjeta inv-grupo' },
+      h('div', { class: 'inv-titulo' }, fotoProducto(fotoDe(lotes[0]), nom, 'en-lote'), h('b', null, nom),
+        h('span', { class: 'chico suave' }, lotes.length + (lotes.length === 1 ? ' lote' : ' lotes'))),
+      lotes.map((l) => tarjetaSemaforo(l, null, lugar === 'principal' ? false : l.disponible_cocina, botones(l)))))
+      : h('p', { class: 'suave' }, 'Ningún producto o lote coincide con la búsqueda.'));
   };
   const guardar = () => intentar(async () => {
-    const cerrar = datos.lotes.filter((l) => noEsta.has(l.id));
-    const ok = await confirmar('Guardar inventario de ' + (lugar === 'principal' ? 'bodega principal' : 'bodega secundaria'),
-      cerrar.length ? 'Estos lotes ya no están y salen de la lista: ' + cerrar.map((l) => nombreDe(l) + ' | ' + l.lote).join(', ') + '.'
-        : 'Todos los lotes siguen en la bodega.', 'Guardar inventario');
+    const n = datos.lotes.length;
+    const ok = await confirmar('Guardar inventario de ' + nombreLugar,
+      'Queda registrado que hoy revisaste la bodega y que ' + (n === 1 ? 'el lote de la lista sigue' : 'los ' + n + ' lotes de la lista siguen')
+      + ' ahí. Si alguno ya no está, cancela y dale de baja con «Ya no está».', 'Guardar inventario');
     if (!ok) return;
-    const r = await api('/inventarios', { lugar, items: datos.lotes.map((l) => ({ lote_id: l.id, esta: !noEsta.has(l.id) })) });
-    avisar('Inventario guardado: ' + r.revisados + ' lotes revisados' + (r.cerrados ? ', ' + r.cerrados + ' cerrados' : ''), 'bien');
-    volver();
+    const r = await api('/inventarios', { lugar, items: datos.lotes.map((l) => ({ lote_id: l.id, esta: true })) });
+    avisar('Inventario guardado: ' + r.revisados + ' lotes revisados', 'bien');
+    if (opc.irHistorial) opc.irHistorial(); else await cargar();
   });
-  llenar(caja,
-    textoUltimoInventario(datos.ultimo, datos.dias_inventario),
-    datos.lotes.length ? [
-      h('p', { class: 'suave', style: 'margin:.2rem 0 .6rem' }, 'Revisa la bodega. Toca los lotes que ya no están.'),
-      datos.lotes.length > 6 ? h('input', { type: 'search', placeholder: 'Buscar producto o lote', oninput: (e) => { filtro = e.target.value; pintarLista(); } }) : null,
-      lista, h('div', { style: 'height:5rem' }), h('div', { class: 'pie-fijo' }, h('div', null, botonGuardar))]
-      : h('p', { class: 'suave' }, 'No hay lotes en esta bodega.'));
-  pintarLista(); contar();
+  const pintarTodo = () => {
+    const n = datos.lotes.length;
+    const sinFecha = datos.lotes.filter((l) => !l.semaforo).length;
+    const leyenda = leyendaSemaforo(datos.lotes);
+    if (sinFecha) leyenda.append(' ', h('span', { class: 'etq gris' }, sinFecha + ' sin fecha de caducidad'));
+    buscador.value = filtro;
+    llenar(caja,
+      textoUltimoInventario(datos.ultimo, datos.dias_inventario),
+      n ? [
+        leyenda,
+        h('p', { class: 'suave', style: 'margin:.2rem 0 .6rem' }, 'Revisa la bodega. Si un lote ya no está, toca ', h('b', null, 'Dar de baja'), ' y elige ', h('b', null, 'Ya no está'), '.'),
+        n > 6 ? buscador : null,
+        lista, h('div', { style: 'height:5rem' }),
+        h('div', { class: 'pie-fijo' }, h('div', null, h('button', { class: 'boton principal', type: 'button', onclick: guardar },
+          'Guardar inventario · ' + n + ' lote' + (n === 1 ? '' : 's'))))]
+        : h('p', { class: 'suave' }, 'No hay lotes en esta bodega.'));
+    pintarLista();
+  };
+  await cargar();
 }
 
 async function panelHistorialInventario(lugar, caja, recargar) {
@@ -1141,7 +1182,9 @@ async function panelHistorialInventario(lugar, caja, recargar) {
     datos.inventarios.length ? trozo(datos.inventarios, pag, 15).map((inv) => h('div', { class: 'tarjeta' },
       h('div', { style: 'display:flex;justify-content:space-between;gap:.6rem;flex-wrap:wrap' },
         h('b', null, hora(inv.fecha_hora) + ' · ' + (inv.persona || '')),
-        h('span', { class: 'chico suave' }, inv.revisados + ' revisados · ' + inv.cerrados + ' ya no estaban')),
+        inv.tipo === 'suelto' ? h('span', { class: 'etq gris' }, 'Dado de baja: ya no está')
+          : h('span', { class: 'chico suave' }, inv.revisados + ' revisados · ' + inv.cerrados + ' ya no estaban')),
+      inv.tipo === 'suelto' && inv.nota ? h('div', { class: 'chico suave', style: 'margin-top:.2rem' }, 'Comentario: ' + inv.nota) : null,
       inv.cerrados_lotes.length ? h('div', { style: 'margin-top:.5rem' }, inv.cerrados_lotes.map((c) => h('div', { class: 'fila-cerrado' },
         h('span', null, h('b', null, c.producto || c.ingrediente), ' | ', h('b', { class: 'mono' }, c.lote)),
         c.reabierto_en ? h('span', { class: 'etq gris' }, 'Vuelto a poner ' + hora(c.reabierto_en))
@@ -1151,79 +1194,44 @@ async function panelHistorialInventario(lugar, caja, recargar) {
   pintarHist();
 }
 
-// Bodega principal: Inventario · Semáforo · Historial
+// Bodega principal: Inventario (con el semáforo de caducidad) · Historial
 async function vistaInventario(pestana) {
-  pestana = ['inventario', 'semaforo', 'historial'].includes(pestana) ? pestana : 'inventario';
+  pestana = pestana === 'historial' ? 'historial' : 'inventario';      // «semaforo» (enlace anterior) ahora es el inventario
   const ir = (id) => { history.replaceState(null, '', '#/inventario/' + id); vistaInventario(id); };
   const caja = h('div', null);
-  let rojos = 0;
-  let lotes = [];
-  if (pestana === 'semaforo') { lotes = (await api('/bodega/lotes')).lotes; rojos = lotes.filter((l) => l.semaforo === 'rojo').length; }
-  const pest = [['inventario', 'Inventario'], ['semaforo', 'Semáforo'], ['historial', 'Historial']];
+  const rojos = insigniaRojos();
+  const pest = [['inventario', ['Inventario', rojos.el]], ['historial', 'Historial']];
   pintar(encabezado('Inventario de bodega principal'),
     h('div', { class: 'pestanas' }, pest.map(([id, nombre]) => h('button', { type: 'button', class: id === pestana ? 'activa' : '', onclick: () => ir(id) }, nombre))),
     caja);
-  if (pestana === 'inventario') return panelInventario('principal', caja, () => ir('historial'));
-  if (pestana === 'historial') return panelHistorialInventario('principal', caja, () => ir('historial'));
-  const cat = await api('/bodega/catalogo');
-  const fotoDe = (nombre) => (cat.productos.find((p) => p.producto === nombre) || {}).foto || null;
-  let filtro = '';
-  const pintarSem = () => {
-    const n = normal(filtro);
-    const visibles = lotes.filter((l) => !n || normal([l.producto_bodega, l.ingrediente, l.lote, l.proveedor].join(' ')).includes(n));
-    llenar(caja, lotes.length ? leyendaSemaforo(lotes) : null,
-      lotes.length > 6 ? buscadorLotes(caja, filtro, (v) => { filtro = v; pintarSem(); }) : null,
-      lotes.length ? (visibles.length ? visibles.map((l) => tarjetaSemaforo(l, l.producto_bodega || l.ingrediente, false, [
-        h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => { if (await editarIngresoLote(l)) ir('semaforo'); }) }, 'Editar ingreso'),
-        h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => { if (await darDeBaja(l, 'principal', null)) ir('semaforo'); }) }, 'Dar de baja')],
-        fotoDe(l.producto_bodega))) : h('p', { class: 'suave' }, 'Ningún lote coincide con la búsqueda.'))
-        : h('p', { class: 'suave' }, 'No hay lotes en bodega principal.'));
-  };
-  pintarSem();
+  if (pestana === 'historial') {
+    api('/bodega/lotes').then((r) => rojos.poner(r.lotes)).catch(() => {});
+    return panelHistorialInventario('principal', caja, () => ir('historial'));
+  }
+  return panelInventario('principal', caja, { irHistorial: () => ir('historial'), alCargar: rojos.poner });
 }
 
 // ------------------------------------------------------------------ bodega secundaria
-// Pestañas: registrar ingreso (lo que llega de bodega principal) y semáforo de lo que hay en bodega secundaria.
+// Pestañas: registrar ingreso (lo que llega de bodega principal), inventario (con el semáforo de caducidad) e historial.
 async function vistaSecundaria(pestana) {
-  pestana = ['semaforo', 'inventario', 'historial'].includes(pestana) ? pestana : 'ingreso';
+  pestana = pestana === 'semaforo' ? 'inventario' : ['inventario', 'historial'].includes(pestana) ? pestana : 'ingreso';
   const [ings, lotesSec] = await Promise.all([api('/ingredientes'), api('/lotes?donde=secundaria')]);
   const deProveedor = ings.filter((i) => i.tipo === 'lote' && i.activo);
-  const enBodega = ordenarSemaforo(lotesSec);
-  // Semáforo de lo que hay en bodega secundaria: arriba lo caducado y lo que caduca antes.
-  const cajaSec = h('div', null);
-  let filtro = '';
-  const pintarSec = () => {
-    const n = normal(filtro);
-    const visibles = enBodega.filter((l) => !n || normal([l.ingrediente, l.producto_bodega, l.lote, l.proveedor].join(' ')).includes(n));
-    llenar(cajaSec,
-      enBodega.length ? leyendaSemaforo(enBodega) : null,
-      enBodega.length > 6 ? buscadorLotes(cajaSec, filtro, (v) => { filtro = v; pintarSec(); }) : null,
-      enBodega.length ? (visibles.length ? visibles.map((l) => tarjetaSemaforo(l, l.producto_bodega || l.ingrediente, l.disponible_cocina, [
-        l.semaforo ? null : h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
-          if (await editarIngresoLote(l)) vistaSecundaria('semaforo'); }) }, 'Poner caducidad'),
-        h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
-          if (await darDeBaja(l, 'secundaria', l.disponible_cocina)) vistaSecundaria('semaforo'); }) }, 'Dar de baja')],
-        (ings.find((i) => i.id === l.ingrediente_id) || {}).foto || null))
-        : h('p', { class: 'suave' }, 'Ningún lote coincide con la búsqueda.'))
-        : h('p', { class: 'suave' }, 'Todavía no hay lotes registrados.'));
-  };
-  const rojos = enBodega.filter((l) => l.semaforo === 'rojo').length;
-  const pest = [['ingreso', 'Registrar ingreso'], ['semaforo', ['Semáforo', rojos ? h('span', { class: 'num rojo', title: rojos + ' caducado(s)' }, rojos) : null]],
-    ['inventario', 'Inventario'], ['historial', 'Historial']];
+  const irSec = (id) => { history.replaceState(null, '', '#/secundaria/' + id); vistaSecundaria(id); };
+  const rojos = insigniaRojos();
+  const pest = [['ingreso', 'Registrar ingreso'], ['inventario', ['Inventario', rojos.el]], ['historial', 'Historial']];
   const cajaInv = h('div', null);
   pintar(encabezado('Bodega secundaria', 'Registra aquí cada lote que llega desde bodega principal.'),
-    h('div', { class: 'pestanas' }, pest.map(([id, nombre]) => h('button', { type: 'button', class: (id === pestana ? 'activa' : '') + (id === 'semaforo' && rojos ? ' con-rojo' : ''),
-      onclick: () => { history.replaceState(null, '', '#/secundaria/' + id); vistaSecundaria(id); } }, nombre))),
+    h('div', { class: 'pestanas' }, pest.map(([id, nombre]) => h('button', { type: 'button', class: id === pestana ? 'activa' : '', onclick: () => irSec(id) }, nombre))),
     pestana === 'ingreso' ? [
       h('h2', { style: 'margin-top:.4rem' }, '¿Qué ingrediente llegó?'),
       // Solo se puede elegir un ingrediente que tenga lotes en bodega principal (el número no se muestra).
       h('div', { class: 'rejilla' }, deProveedor.map((i) => h('button', { class: 'mosaico con-foto' + (i.n_principal ? '' : ' vacio'), type: 'button',
         disabled: !i.n_principal, onclick: () => intentar(() => elegirIngreso(i)) }, fotoProducto(i.foto, i.nombre), h('b', null, i.nombre)))),
       h('p', { class: 'chico suave' }, 'Aquí se registra todo lo que llega a la panadería, secos y refrigerados (mantequilla, huevos, leche…).')]
-      : pestana === 'semaforo' ? cajaSec : cajaInv);
-  if (pestana === 'semaforo') pintarSec();
-  const irSec = (id) => { history.replaceState(null, '', '#/secundaria/' + id); vistaSecundaria(id); };
-  if (pestana === 'inventario') await panelInventario('secundaria', cajaInv, () => irSec('historial'));
+      : cajaInv);
+  rojos.poner(lotesSec);
+  if (pestana === 'inventario') await panelInventario('secundaria', cajaInv, { irHistorial: () => irSec('historial'), alCargar: rojos.poner });
   if (pestana === 'historial') await panelHistorialInventario('secundaria', cajaInv, () => irSec('historial'));
 }
 
