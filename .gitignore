@@ -1,6 +1,9 @@
-# Datos de la app: no se suben a GitHub (registros reales, respaldos y pruebas)
-TrazaPanUSFQ3/datos/
+# Se suben a GitHub el programa y los datos de la app (base y fotos).
+# No se suben: copias automaticas, datos de prueba, temporales de Python y de SQLite.
+TrazaPanUSFQ3/datos/respaldos/
 TrazaPanUSFQ3/datos_pruebas/
-# Archivos temporales de Python
+TrazaPanUSFQ3/datos/servidor.log
 __pycache__/
 *.pyc
+*.db-wal
+*.db-shm
