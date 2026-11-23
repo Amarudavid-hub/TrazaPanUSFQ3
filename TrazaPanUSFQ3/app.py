@@ -455,6 +455,10 @@ def migrar(con):
     con.execute("""CREATE TABLE IF NOT EXISTS avisos(
         id INTEGER PRIMARY KEY, area TEXT NOT NULL, lote_id INTEGER REFERENCES lotes(id), texto TEXT NOT NULL,
         creado_en TEXT NOT NULL, creado_por TEXT, resuelto_en TEXT, resuelto_por TEXT, comentario TEXT DEFAULT '')""")
+    if "tipo" not in {f["name"] for f in con.execute("PRAGMA table_info(avisos)")}:
+        # manual_cocina: cocina anoto un lote que no estaba en bodega secundaria (bodega secundaria registra lo que entro)
+        con.execute("ALTER TABLE avisos ADD COLUMN tipo TEXT DEFAULT ''")
+        con.execute("UPDATE avisos SET tipo='manual_cocina' WHERE area='produccion' AND texto LIKE '%porque no aparecía en bodega secundaria%'")
     if "principal_vacio" not in {f["name"] for f in con.execute("PRAGMA table_info(lotes)")}:
         con.execute("ALTER TABLE lotes ADD COLUMN principal_vacio INTEGER DEFAULT 0")
         # Antes, todo lo que pasaba a secundaria salia de la lista de bodega principal.
@@ -2850,15 +2854,15 @@ def api_lote_manual():
     # Bodega secundaria no lo encontro -> avisa a bodega principal. Cocina no lo encontro -> avisa a bodega secundaria.
     if datos.get("destino") == "cocina":
         avisos = [("produccion", "%s anotó a mano el lote %s de %s (%s) porque no aparecía en bodega secundaria. "
-                                 "Verifica de dónde salió; si tampoco está en bodega principal, avisa para que registren su recepción.%s"
-                   % (persona, codigo, ing["nombre"], detalle, comentario))]
+                                 "Registra cuánto entró a bodega secundaria de ese lote.%s"
+                   % (persona, codigo, ing["nombre"], detalle, comentario), "manual_cocina")]
     else:
         avisos = [("bodega", "%s anotó a mano el lote %s de %s en bodega secundaria (%s) porque no aparecía en bodega principal. "
                              "Registra su recepción con el mismo código y la cantidad total que llegó.%s"
-                   % (persona, codigo, ing["nombre"], detalle, comentario))]
-    for area_aviso, texto in avisos:
-        con.execute("INSERT INTO avisos(area,lote_id,texto,creado_en,creado_por) VALUES(?,?,?,?,?)",
-                    (area_aviso, lote_id, texto, ahora(), persona))
+                   % (persona, codigo, ing["nombre"], detalle, comentario), "manual_secundaria")]
+    for area_aviso, texto, tipo in avisos:
+        con.execute("INSERT INTO avisos(area,lote_id,texto,creado_en,creado_por,tipo) VALUES(?,?,?,?,?,?)",
+                    (area_aviso, lote_id, texto, ahora(), persona, tipo))
     anteriores = []
     if datos.get("destino") == "cocina":
         if abrir_lote(con, un_lote(con, lote_id), persona):
@@ -4077,7 +4081,10 @@ def api_avisos():
     area_aviso = request.args.get("area") or ""
     con = db()
     datos = filas(con.execute(
-        """SELECT a.id, a.texto, a.creado_en, a.creado_por, a.lote_id, l.lote, l.foto, l.origen, l.caducidad, i.nombre AS ingrediente,
+        """SELECT a.id, a.texto, a.creado_en, a.creado_por, a.lote_id, a.tipo, l.lote, l.foto, l.origen, l.caducidad, i.nombre AS ingrediente,
+                  (SELECT COALESCE(SUM(sc.cantidad),0) FROM salidas_cocina sc WHERE sc.lote_id=l.id) AS tomado_cocina,
+                  (SELECT al.contenido FROM alias al WHERE al.ingrediente_id=l.ingrediente_id AND al.en_catalogo=1 AND al.ignorar=0 ORDER BY al.id LIMIT 1) AS contenido,
+                  (SELECT al.unidad_contenido FROM alias al WHERE al.ingrediente_id=l.ingrediente_id AND al.en_catalogo=1 AND al.ignorar=0 ORDER BY al.id LIMIT 1) AS unidad_contenido,
                   (SELECT COALESCE(SUM(t.cantidad),0) FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0) AS trasladado,
                   EXISTS(SELECT 1 FROM recepciones r WHERE r.lote_id=l.id AND r.anulado=0) AS tiene_recepcion,
                   (SELECT al.producto FROM alias al WHERE al.ingrediente_id=l.ingrediente_id AND al.en_catalogo=1 AND al.ignorar=0 ORDER BY al.id LIMIT 1) AS producto,
@@ -4087,7 +4094,63 @@ def api_avisos():
     for a in datos:
         # Lote anotado a mano en bodega secundaria que bodega principal todavia no registro: se resuelve registrando la recepcion
         a["registrar_recepcion"] = bool(area_aviso == "bodega" and a["lote_id"] and a["origen"] == "manual" and not a["tiene_recepcion"])
+        # Lote que cocina anoto a mano: bodega secundaria registra cuanto entro
+        a["registrar_entrada"] = bool(area_aviso == "produccion" and a["lote_id"] and a["tipo"] == "manual_cocina")
     return jsonify(datos)
+
+
+@app.post("/api/avisos/<int:aviso_id>/entrada")
+def api_aviso_entrada(aviso_id):
+    """Bodega secundaria registra cuanto entro de un lote que cocina anoto a mano. Si bodega principal
+    no tiene su recepcion, le llega el aviso para registrarla (con la pregunta de si hay mas)."""
+    datos = cuerpo()
+    persona = persona_de(datos)
+    con = db()
+    av = con.execute("SELECT * FROM avisos WHERE id=? AND resuelto_en IS NULL", (aviso_id,)).fetchone()
+    if not av or av["tipo"] != "manual_cocina" or not av["lote_id"]:
+        raise ErrorApi("Este aviso ya se resolvió.")
+    l = un_lote(con, av["lote_id"])
+    emp = con.execute("SELECT empaque, contenido, unidad_contenido FROM alias WHERE ingrediente_id=? AND en_catalogo=1 AND ignorar=0 "
+                      "AND COALESCE(empaque,'')<>'' ORDER BY id LIMIT 1", (l["ingrediente_id"],)).fetchone()
+    if emp:
+        cantidad, unidad = entero_paquetes(datos.get("cantidad"), emp["empaque"], "cuánto entró"), emp["empaque"]
+    else:
+        cantidad, unidad = numero(datos.get("cantidad")), ""
+        if not cantidad or cantidad <= 0:
+            raise ErrorApi("Escribe cuánto entró (solo el número).")
+    caducidad = str(datos.get("caducidad") or "")[:10]
+    try:
+        dt.date.fromisoformat(caducidad)
+    except ValueError:
+        raise ErrorApi("Escribe la fecha de caducidad que dice el empaque.")
+    trasladado = con.execute("SELECT COALESCE(SUM(cantidad),0) FROM traslados WHERE lote_id=? AND anulado=0", (l["id"],)).fetchone()[0]
+    tomado = con.execute("SELECT COALESCE(SUM(cantidad),0) FROM salidas_cocina WHERE lote_id=?", (l["id"],)).fetchone()[0]
+    datos_emp = dict(emp) if emp else {"unidad": unidad}
+    if cantidad < max(trasladado, tomado):
+        raise ErrorApi("No puede ser menos de lo que cocina ya tomó (%s)." % cantidad_texto(max(trasladado, tomado), datos_emp))
+    if cantidad > trasladado:
+        con.execute("INSERT INTO traslados(lote_id,cantidad,unidad,fecha_hora,persona) VALUES(?,?,?,?,?)",
+                    (l["id"], cantidad - trasladado, unidad, ahora(), persona))
+    con.execute("UPDATE lotes SET caducidad=?, en_secundaria=? WHERE id=?", (caducidad, 1 if cantidad > tomado else 0, l["id"]))
+    texto_cant = cantidad_texto(cantidad, datos_emp)
+    con.execute("UPDATE avisos SET resuelto_en=?, resuelto_por=?, comentario=? WHERE id=?",
+                (ahora(), persona, "Entraron %s a bodega secundaria." % texto_cant, aviso_id))
+    if not con.execute("SELECT 1 FROM recepciones WHERE lote_id=? AND anulado=0", (l["id"],)).fetchone():
+        ing = con.execute("SELECT nombre FROM ingredientes WHERE id=?", (l["ingrediente_id"],)).fetchone()
+        con.execute("INSERT INTO avisos(area,lote_id,texto,creado_en,creado_por,tipo) VALUES(?,?,?,?,?,?)",
+                    ("bodega", l["id"], "%s registró que entraron a bodega secundaria %s del lote %s de %s (caduca el %s), que cocina anotó a mano "
+                     "porque no aparecía. Registra su recepción con el mismo código y la cantidad total que llegó."
+                     % (persona, texto_cant, l["lote"], ing["nombre"], dt.date.fromisoformat(caducidad).strftime("%d/%m/%Y")),
+                     ahora(), persona, "manual_secundaria"))
+    else:        # ya tiene recepcion: solo se informa, lo que paso a secundaria ya se desconto de bodega principal
+        ing = con.execute("SELECT nombre FROM ingredientes WHERE id=?", (l["ingrediente_id"],)).fetchone()
+        con.execute("INSERT INTO avisos(area,lote_id,texto,creado_en,creado_por,tipo) VALUES(?,?,?,?,?,?)",
+                    ("bodega", l["id"], "%s registró que pasaron a bodega secundaria %s del lote %s de %s, que cocina anotó a mano "
+                     "porque no aparecía. Ya se descontó de bodega principal: revisa que coincida con lo que hay."
+                     % (persona, texto_cant, l["lote"], ing["nombre"]), ahora(), persona, ""))
+    anotar(con, persona, "Entrada de lote anotado por cocina", "Lote %s: entraron %s" % (l["lote"], texto_cant), lote_id=l["id"])
+    con.commit()
+    return jsonify(ok=True)
 
 
 @app.post("/api/avisos/<int:aviso_id>/revisado")

@@ -497,13 +497,22 @@ function pintarAvisosInicio(caja) {
   caja.replaceChildren(...(n ? [h('button', { class: 'nota rojo aviso-inicio', type: 'button', onclick: () => verAvisos() },
     h('b', null, '🔔 ' + (n === 1 ? '1 aviso por revisar' : n + ' avisos por revisar')), h('div', { class: 'chico' }, avisosPendientes[0].texto))] : []));
 }
+// Texto del aviso con el código de lote y el nombre del ingrediente en negrilla
+function textoAviso(a) {
+  const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const terminos = [a.ingrediente, a.lote].filter(Boolean).sort((x, y) => y.length - x.length);
+  if (!terminos.length) return a.texto;
+  const re = new RegExp('(?<![\\w-])(' + terminos.map(esc).join('|') + ')(?![\\w-])', 'g');
+  return a.texto.split(re).map((parte, i) => (i % 2 ? h('b', null, parte) : parte));
+}
+
 async function verAvisos() {
   const cont = h('div', null);
   const dibujar = () => {
     cont.replaceChildren(...(avisosPendientes.length ? avisosPendientes.map((a) => {
       const resp = h('input', { type: 'text', placeholder: 'Qué pasó (opcional)' });
       return h('div', { class: 'tarjeta', style: 'margin:.6rem 0' },
-        h('p', { style: 'margin-top:0' }, a.texto),
+        h('p', { style: 'margin-top:0' }, textoAviso(a)),
         h('div', { class: 'chico suave' }, hora(a.creado_en)),
         a.foto ? h('p', null, h('a', { href: '/fotos/' + a.foto, target: '_blank' }, 'Ver foto del empaque')) : null,
         a.registrar_recepcion ? [
@@ -513,6 +522,8 @@ async function verAvisos() {
               if (await registrarDesdeAviso(a, true)) { await revisarAvisos(); dibujar(); } }) }, 'Sí, hay más'),
             h('button', { class: 'boton', type: 'button', onclick: () => intentar(async () => {
               if (await registrarDesdeAviso(a, false)) { await revisarAvisos(); dibujar(); } }) }, 'No, solo llegó eso'))]
+          : a.registrar_entrada ? h('button', { class: 'boton principal', type: 'button', style: 'margin-top:.6rem;width:100%', onclick: () => intentar(async () => {
+            if (await registrarEntradaAviso(a)) { await revisarAvisos(); dibujar(); } }) }, 'Registrar lo que entró')
           : [resp,
             h('button', { class: 'boton ok', type: 'button', style: 'margin-top:.5rem', onclick: () => intentar(async () => {
               await api('/avisos/' + a.id + '/revisado', { comentario: resp.value.trim() });
@@ -800,7 +811,7 @@ function formRecepcion(cat, ini, editar) {
     h('div', { class: 'campo completo' }, cajaDecision),
     campo('Observaciones', c.observaciones, 'completo'),
     h('div', { class: 'campo completo fotos-recepcion' },
-      h('div', null, h('label', null, 'Foto del lote (etiqueta del empaque)'),
+      h('div', null, h('label', null, 'Foto del lote (etiqueta)'),
         editar && ini.foto_lote ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + ini.foto_lote, 'Lote ' + ini.lote_texto) }, 'Ver la foto guardada (puedes reemplazarla)') : null,
         fotos.lote.el),
       h('div', null, h('label', null, 'Foto de la requisición'),
@@ -828,6 +839,26 @@ function formRecepcion(cat, ini, editar) {
   };
   const elegirProducto = (nombre) => { const p = cat.productos.find((x) => x.producto === nombre); if (p && prod) prod.elegir(p); return p; };
   return { el, leer, limpiar, fotos, campos: c, elegirProducto };
+}
+
+// Lote que cocina anotó a mano: bodega secundaria registra cuánto entró (y la caducidad).
+async function registrarEntradaAviso(a) {
+  const e = a.empaque ? a : null;
+  const ya = Math.max(Number(a.trasladado) || 0, Number(a.tomado_cocina) || 0);
+  const cuanto = (n) => (e ? cantidadLote(n, e) : num(n));
+  let cant = String(ya);
+  const { campo, eq } = campoEmpaques(a, cant, (v) => { cant = v; }, e ? 'Número de ' + nombreEmpaque(e.empaque, 2) : 'Solo números');
+  const cad = h('input', { type: 'date', value: /^\d{4}-\d{2}-\d{2}$/.test(a.caducidad || '') ? a.caducidad : '' });
+  const ok = await modal('Registrar el lote ' + a.lote + ' en bodega secundaria', h('div', null,
+    h('div', { class: 'nota' }, 'Cocina ya tomó ', h('b', null, cuanto(a.tomado_cocina)), '. Escribe cuánto entró a bodega secundaria de este lote (si cocina se llevó todo, deja el mismo número).'),
+    h('div', { class: 'campo' }, h('label', null, 'Cuánto entró', e ? ' (' + nombreEmpaque(e.empaque, 2) + ')' : ''), campo, eq),
+    h('div', { class: 'campo' }, h('label', null, 'Fecha de caducidad'), cad)),
+    [{ texto: 'Guardar', clase: 'principal', valor: true }, { texto: 'Cancelar', valor: null }]);
+  if (!ok) return false;
+  if (!cant || Number(cant) < ya) throw new Error('No puede ser menos de lo que cocina ya tomó (' + cuanto(ya) + ').');
+  await api('/avisos/' + a.id + '/entrada', { cantidad: cant, caducidad: cad.value });
+  avisar(a.tiene_recepcion ? 'Listo. Se avisó a bodega principal.' : 'Listo. Se avisó a bodega principal para que registre la recepción.', 'bien');
+  return true;
 }
 
 // Desde el aviso de un lote anotado a mano en bodega secundaria: bodega principal registra la recepción.

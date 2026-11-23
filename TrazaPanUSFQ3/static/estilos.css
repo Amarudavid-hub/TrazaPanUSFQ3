@@ -477,3 +477,4 @@ tr.fuera-pagina { display: none; }
 .empaque-linea input { width: 5.5rem !important; }
 .unidad-fija.vacia { background: transparent; border: 1px dashed var(--borde, #cfd5e2); }
 .acciones-aviso { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+.fotos-recepcion label { display: block; }
