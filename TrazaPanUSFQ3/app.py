@@ -336,6 +336,7 @@ def preparar_base():
         con.execute("DELETE FROM meta WHERE clave IN ('v7_mezclas','v8_recipientes','v11_catalogo_ingredientes','v14_subrecetas')")
     sembrar_mezclas(con)
     aplicar_empaques(con)
+    cierres_anteriores(con)
     # Subrecetas y Mix Bread no tienen etapa de masa.
     con.execute("UPDATE productos SET lleva_reposo=0 WHERE COALESCE(armado,0)=1 OR produce_ingrediente_id IS NOT NULL")
     # En un servidor en internet: la contraseña inicial de las tres áreas viene de TRAZAPAN_CLAVE_INICIAL.
@@ -1865,6 +1866,57 @@ def api_inventarios():
                    lotes=listar_lotes(con, lugar, limite=2000))
 
 
+# Cuando el inventario dice que un lote «ya no está», lo que la app creia que quedaba se descuenta (cierre).
+# Asi, si despues llega otra entrega con el mismo codigo de lote, empieza desde cero y no revive lo anterior.
+AREA_CIERRE = "CIERRE INVENTARIO"
+MOTIVO_CIERRE = "Inventario N.º %d: ya no estaba"
+_TIEMPO_RECEPCION = "COALESCE(NULLIF(r.registrado_en,''), NULLIF(r.importado_en,''), r.fecha_ingreso)"
+
+
+def saldo_al(con, lote_id, lugar, hasta=None):
+    """Lo que la app cree que queda del lote en esa bodega (hasta un momento dado, o ahora)."""
+    t = hasta or "9999"
+    q = lambda sql: con.execute(sql, (lote_id, t)).fetchone()[0] or 0
+    if lugar == "principal":
+        cantidades = [numero(f[0]) for f in con.execute(
+            "SELECT r.cantidad FROM recepciones r WHERE r.lote_id=? AND r.anulado=0 AND " + _TIEMPO_RECEPCION + " <= ?", (lote_id, t))]
+        if None in cantidades:
+            return 0
+        return (sum(cantidades) - q("SELECT SUM(cantidad) FROM traslados WHERE lote_id=? AND anulado=0 AND fecha_hora<=?")
+                - q("SELECT SUM(cantidad) FROM salidas_areas WHERE lote_id=? AND anulado=0 AND fecha_hora<=?"))
+    return (q("SELECT SUM(cantidad) FROM traslados WHERE lote_id=? AND anulado=0 AND fecha_hora<=?")
+            - q("SELECT SUM(cantidad) FROM salidas_cocina WHERE lote_id=? AND anulado=0 AND fecha_hora<=?")
+            - q("SELECT SUM(cantidad) FROM bajas WHERE lote_id=? AND lugar='secundaria' AND anulado=0 AND fecha_hora<=?"))
+
+
+def cerrar_saldo(con, lote_id, lugar, inventario_id, persona, cuando=None):
+    cuando = cuando or ahora()
+    cant = max(round(saldo_al(con, lote_id, lugar, cuando), 3), 0)
+    unidad = (con.execute("SELECT unidad FROM recepciones WHERE lote_id=? ORDER BY id DESC LIMIT 1", (lote_id,)).fetchone() or [""])[0]
+    if lugar == "principal":
+        con.execute("INSERT INTO salidas_areas(lote_id,cantidad,unidad,area,motivo,fecha_hora,persona) VALUES(?,?,?,?,?,?,?)",
+                    (lote_id, cant, unidad, AREA_CIERRE, MOTIVO_CIERRE % inventario_id, cuando, persona))
+    else:
+        con.execute("INSERT INTO bajas(lote_id,lugar,cantidad,unidad,motivo,comentario,fecha_hora,persona) VALUES(?,?,?,?,?,?,?,?)",
+                    (lote_id, "secundaria", cant, unidad, MOTIVO_CIERRE % inventario_id, AREA_CIERRE, cuando, persona))
+
+
+def cierres_anteriores(con):
+    """Una sola vez: los lotes que ya se cerraron en inventarios anteriores reciben su cierre."""
+    if con.execute("SELECT 1 FROM meta WHERE clave='v26_cierres'").fetchone():
+        return
+    for f in con.execute("""SELECT il.lote_id, il.inventario_id, inv.lugar, inv.fecha_hora, inv.persona FROM inventario_lotes il
+                            JOIN inventarios inv ON inv.id=il.inventario_id
+                            WHERE il.esta=0 AND il.reabierto_en IS NULL ORDER BY inv.fecha_hora, il.id""").fetchall():
+        cerrar_saldo(con, f["lote_id"], f["lugar"], f["inventario_id"], f["persona"], f["fecha_hora"])
+    con.execute("INSERT INTO meta(clave, valor) VALUES('v26_cierres', '1')")
+
+
+def ultimo_cierre(con, lote_id):
+    fila = con.execute("SELECT MAX(fecha_hora) FROM salidas_areas WHERE lote_id=? AND area=? AND anulado=0", (lote_id, AREA_CIERRE)).fetchone()
+    return fila[0] if fila else None
+
+
 @app.post("/api/inventarios")
 def api_inventario_guardar():
     """Guarda un inventario: items = [{lote_id, esta}]. Los que ya no estan salen de esa bodega."""
@@ -1889,6 +1941,7 @@ def api_inventario_guardar():
         revisados += 1
         if not esta:
             cerrados += 1
+            cerrar_saldo(con, lote_id, lugar, inv, persona)
             con.execute("UPDATE lotes SET principal_vacio=1 WHERE id=?" if lugar == "principal"
                         else "UPDATE lotes SET en_secundaria=0 WHERE id=?", (lote_id,))
     con.execute("UPDATE inventarios SET revisados=?, cerrados=? WHERE id=?", (revisados, cerrados, inv))
@@ -1911,6 +1964,13 @@ def api_inventario_reabrir(il_id):
         raise ErrorApi("Ese lote ya se había vuelto a poner.")
     con.execute("UPDATE lotes SET principal_vacio=0 WHERE id=?" if fila["lugar"] == "principal"
                 else "UPDATE lotes SET en_secundaria=1 WHERE id=?", (fila["lote_id"],))
+    motivo = MOTIVO_CIERRE % fila["inventario_id"]
+    if fila["lugar"] == "principal":
+        con.execute("UPDATE salidas_areas SET anulado=1, motivo_anulacion='Se marcó por error en el inventario' "
+                    "WHERE lote_id=? AND area=? AND motivo=? AND anulado=0", (fila["lote_id"], AREA_CIERRE, motivo))
+    else:
+        con.execute("UPDATE bajas SET anulado=1, motivo_anulacion='Se marcó por error en el inventario' "
+                    "WHERE lote_id=? AND lugar='secundaria' AND motivo=? AND anulado=0", (fila["lote_id"], motivo))
     con.execute("UPDATE inventario_lotes SET reabierto_en=?, reabierto_por=? WHERE id=?", (ahora(), persona, il_id))
     anotar(con, persona, "INVENTARIO_REABRIR", "Lote %s vuelve a %s" % (fila["lote"], LUGARES_INVENTARIO[fila["lugar"]]), fila["lote_id"])
     con.commit()
@@ -2185,8 +2245,13 @@ def api_recepcion_editar(rid):
 @app.get("/api/lotes/<int:lote_id>/recepciones")
 def api_recepciones_de_lote(lote_id):
     """Las recepciones de bodega principal de un lote (para corregirlas desde el semaforo o el inventario)."""
-    return jsonify(filas(db().execute(RECEPCION_SQL + " WHERE r.lote_id=? AND r.anulado=0 ORDER BY r.fecha_ingreso DESC, r.id DESC",
-                                      (lote_id,))))
+    con = db()
+    todas = filas(con.execute(RECEPCION_SQL + " WHERE r.lote_id=? AND r.anulado=0 ORDER BY r.fecha_ingreso DESC, r.id DESC", (lote_id,)))
+    cierre = ultimo_cierre(con, lote_id)
+    if cierre:      # solo las entregas que llegaron despues de que el lote se cerro en un inventario
+        nuevas = [r for r in todas if (r.get("registrado_en") or r.get("importado_en") or r.get("fecha_ingreso") or "") >= cierre]
+        todas = nuevas or todas
+    return jsonify(todas)
 
 
 FOTOS_RECEPCIONES = os.path.join(FOTOS, "recepciones")
