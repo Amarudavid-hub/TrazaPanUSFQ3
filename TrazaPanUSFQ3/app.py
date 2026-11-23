@@ -337,6 +337,7 @@ def preparar_base():
     sembrar_mezclas(con)
     aplicar_empaques(con)
     cierres_anteriores(con)
+    reparar_inventario(con)
     # Subrecetas y Mix Bread no tienen etapa de masa.
     con.execute("UPDATE productos SET lleva_reposo=0 WHERE COALESCE(armado,0)=1 OR produce_ingrediente_id IS NOT NULL")
     # En un servidor en internet: la contraseña inicial de las tres áreas viene de TRAZAPAN_CLAVE_INICIAL.
@@ -1922,6 +1923,55 @@ def cerrar_saldo(con, lote_id, lugar, inventario_id, persona, cuando=None):
                     (lote_id, "secundaria", cant, unidad, MOTIVO_CIERRE % inventario_id, AREA_CIERRE, cuando, persona))
 
 
+def ajustar_cierres(con, lote_id):
+    """Un cierre («ya no estaba») se lleva solo lo que había del lote en ese momento. Si después se anula o corrige una
+    entrega anterior, el cierre se recalcula: así nunca se «come» una entrega nueva del mismo lote (que quedaría oculta)."""
+    if not lote_id:
+        return False
+    cambio = False
+    for lugar in ("principal", "secundaria"):
+        if lugar == "principal":
+            tabla = "salidas_areas"
+            cierres = con.execute("SELECT id, cantidad, fecha_hora FROM salidas_areas WHERE lote_id=? AND area=? AND anulado=0 "
+                                  "ORDER BY fecha_hora, id", (lote_id, AREA_CIERRE)).fetchall()
+        else:
+            tabla = "bajas"
+            cierres = con.execute("SELECT id, cantidad, fecha_hora FROM bajas WHERE lote_id=? AND lugar='secundaria' AND comentario=? "
+                                  "AND anulado=0 ORDER BY fecha_hora, id", (lote_id, AREA_CIERRE)).fetchall()
+        actual = {c["id"]: c["cantidad"] or 0 for c in cierres}
+        for k, c in enumerate(cierres):
+            # saldo_al(hora) ya resta este cierre y los de la misma hora que vienen después: se suman de vuelta.
+            antes = saldo_al(con, lote_id, lugar, c["fecha_hora"]) + sum(
+                actual[x["id"]] for x in cierres[k:] if x["fecha_hora"] <= c["fecha_hora"])
+            # Solo se achica: si una entrega anterior se anuló o se corrigió a menos, el cierre ya no se la puede llevar.
+            nuevo = min(actual[c["id"]], max(round(antes, 3), 0))
+            if abs(nuevo - actual[c["id"]]) > 1e-9:
+                con.execute("UPDATE %s SET cantidad=? WHERE id=?" % tabla, (nuevo, c["id"]))
+                actual[c["id"]] = nuevo
+                cambio = True
+    if cambio:
+        l = un_lote(con, lote_id)
+        if l.get("disponible") is not None:
+            con.execute("UPDATE lotes SET principal_vacio=? WHERE id=? AND agotado=0", (0 if l["disponible"] > 1e-9 else 1, lote_id))
+    return cambio
+
+
+def reparar_inventario(con):
+    """Una sola vez: (1) los productos de la lista de bodega marcados como «no son de panadería» (jamón, fundas) reciben
+    su propio ingrediente, para que lo que se recibe se vea en el inventario; (2) se recalculan los cierres de inventario
+    que se llevaban entregas anuladas o corregidas después."""
+    if con.execute("SELECT 1 FROM meta WHERE clave='v31_reparar_inventario'").fetchone():
+        return
+    for a in con.execute("SELECT id FROM alias WHERE en_catalogo=1 AND (ignorar=1 OR ingrediente_id IS NULL)").fetchall():
+        con.execute("UPDATE alias SET ignorar=0 WHERE id=?", (a["id"],))
+        ingrediente_propio(con, a["id"])
+    materializar(con)
+    for f in con.execute("SELECT DISTINCT lote_id FROM salidas_areas WHERE area=? UNION SELECT DISTINCT lote_id FROM bajas WHERE comentario=?",
+                         (AREA_CIERRE, AREA_CIERRE)).fetchall():
+        ajustar_cierres(con, f[0])
+    con.execute("INSERT INTO meta(clave, valor) VALUES('v31_reparar_inventario', ?)", (ahora(),))
+
+
 def cierres_anteriores(con):
     """Una sola vez: los lotes que ya se cerraron en inventarios anteriores reciben su cierre."""
     if con.execute("SELECT 1 FROM meta WHERE clave='v26_cierres'").fetchone():
@@ -2053,6 +2103,7 @@ def api_salida_anular(salida_id):
     if salida["anulado"]:
         raise ErrorApi("Esa salida ya estaba anulada.")
     con.execute("UPDATE salidas_areas SET anulado=1, motivo_anulacion=? WHERE id=?", (motivo, salida_id))
+    ajustar_cierres(con, con.execute("SELECT lote_id FROM salidas_areas WHERE id=?", (salida_id,)).fetchone()[0])
     lote = un_lote(con, salida["lote_id"])
     if lote["disponible"] is None or lote["disponible"] > 1e-9:
         con.execute("UPDATE lotes SET principal_vacio=0 WHERE id=?", (lote["id"],))
@@ -2177,6 +2228,7 @@ def api_baja_anular(baja_id):
     if b["anulado"]:
         raise ErrorApi("Esa baja ya estaba anulada.")
     con.execute("UPDATE bajas SET anulado=1, motivo_anulacion=? WHERE id=?", (motivo, baja_id))
+    ajustar_cierres(con, con.execute("SELECT lote_id FROM bajas WHERE id=?", (baja_id,)).fetchone()[0])
     lote = un_lote(con, b["lote_id"])
     if b["lugar"] == "secundaria" and (lote["disponible_cocina"] is None or lote["disponible_cocina"] > 1e-9):
         con.execute("UPDATE lotes SET en_secundaria=1, agotado=0 WHERE id=?", (lote["id"],))
@@ -2211,6 +2263,11 @@ def api_recepcion_nueva():
     alias_id = alias["id"]
     if not alias["empaque"]:
         raise ErrorApi("«%s» no tiene empaque. Defínelo en Administrar > Productos de bodega > Empaque." % producto)
+    if alias["ignorar"] or not alias["ingrediente_id"]:
+        # Todo lo que llega a bodega principal se ve en su inventario: el producto recibe su propio ingrediente.
+        con.execute("UPDATE alias SET ignorar=0 WHERE id=?", (alias_id,))
+        ingrediente_propio(con, alias_id)
+        alias = con.execute("SELECT * FROM alias WHERE id=?", (alias_id,)).fetchone()
     v["unidad"] = alias["empaque"]
     v["cantidad"] = str(entero_paquetes(v["cantidad"], alias["empaque"], "la cantidad"))
     previo = con.execute("SELECT origen FROM lotes WHERE ingrediente_id=? AND lote=?",
@@ -2225,6 +2282,7 @@ def api_recepcion_nueva():
     materializar(con)
     rec = recepcion(con, cur.lastrowid)
     if rec["lote_id"]:
+        ajustar_cierres(con, rec["lote_id"])
         l = un_lote(con, rec["lote_id"])
         if l.get("disponible") is not None and l["disponible"] < 0:
             con.execute("UPDATE lotes SET revisar=1, nota=TRIM(COALESCE(nota,'') || ' ' || ?) WHERE id=?",
@@ -2295,6 +2353,9 @@ def api_recepcion_editar(rid):
         (v["fecha"], v["proveedor"], v["lote"], v["cantidad"], v["unidad"], v["caducidad"], v["apariencia"], v["transporte"],
          v["aprobado_por"], v["observaciones"], v["rechazado"], v["lote"], rid))
     materializar(con)
+    for lid in {rec["lote_id"], recepcion(con, rid)["lote_id"]}:
+        if lid and con.execute("SELECT 1 FROM lotes WHERE id=?", (lid,)).fetchone():
+            ajustar_cierres(con, lid)
     anotar(con, persona, "RECEPCION_CORREGIDA", "%s lote %s. %s. Motivo: %s" % (
         rec["producto"], v["lote"], "; ".join(cambios), motivo), recepcion(con, rid)["lote_id"])
     con.commit()
@@ -2361,6 +2422,8 @@ def api_recepcion_anular(rid):
         raise ErrorApi("Esa recepción ya estaba anulada.")
     desvincular(con, rec)
     con.execute("UPDATE recepciones SET anulado=1, motivo_anulacion=? WHERE id=?", (motivo, rid))
+    if rec["lote_id"] and con.execute("SELECT 1 FROM lotes WHERE id=?", (rec["lote_id"],)).fetchone():
+        ajustar_cierres(con, rec["lote_id"])
     anotar(con, persona, "RECEPCION_ANULADA", "%s lote %s. Motivo: %s" % (rec["producto"], rec["lote_texto"], motivo))
     con.commit()
     return jsonify(ok=True)
@@ -2632,6 +2695,7 @@ def api_devolver():
     if lote["abierto_en"] or con.execute("SELECT 1 FROM salidas_cocina WHERE lote_id=?", (lote["id"],)).fetchone():
         raise ErrorApi("Cocina ya tomó del lote %s, así que no fue un registro por error. Si hay que sacarlo, elige Caducado o Contaminado." % lote["lote"])
     con.execute("UPDATE traslados SET anulado=1 WHERE lote_id=? AND anulado=0", (lote["id"],))
+    ajustar_cierres(con, lote["id"])
     con.execute("UPDATE lotes SET en_secundaria=0, principal_vacio=0 WHERE id=?", (lote["id"],))
     anotar(con, persona, "INGRESO_ANULADO", "%s lote %s" % (lote["ingrediente"], lote["lote"]), lote["id"])
     con.commit()
