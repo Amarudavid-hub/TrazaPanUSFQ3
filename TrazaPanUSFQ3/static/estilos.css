@@ -486,3 +486,8 @@ tr.fuera-pagina { display: none; }
 .segmento.varias { flex-wrap: wrap; }
 .segmento.varias button { flex: 1 1 30%; }
 .segmento.varias.pares button { flex: 1 1 40%; }
+/* Elegir entrega: corregir (botón ancho) o eliminar */
+.modal .fila-entrega { display: flex; gap: .5rem; margin: .5rem 0; align-items: stretch; }
+.modal .fila-entrega .boton { margin: 0; width: auto; }
+.modal .fila-entrega .boton:first-child { flex: 1 1 auto; min-width: 0; }
+.modal .fila-entrega .boton.peligro { flex: 0 0 auto; padding-left: 1.1rem; padding-right: 1.1rem; }

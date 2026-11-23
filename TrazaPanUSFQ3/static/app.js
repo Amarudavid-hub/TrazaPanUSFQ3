@@ -84,7 +84,7 @@ function modal(titulo, contenido, botones, obligatoria) {
     };
     const caja = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' },
       obligatoria ? null : h('button', { class: 'cerrar-modal', type: 'button', 'aria-label': 'Cancelar', title: 'Cancelar', onclick: () => cerrar(null) }, '×'),
-      h('h2', null, titulo), contenido, error,
+      h('h2', null, titulo), typeof contenido === 'function' ? contenido(cerrar) : contenido, error,
       (botones || []).map((b) => h('button', { class: 'boton ' + (b.clase || ''), type: 'button',
         onclick: (e) => pulsar(b, e.currentTarget) }, b.texto)));
     const velo = h('div', { class: 'velo' }, caja);
@@ -953,16 +953,37 @@ async function corregirRecepcion(cat, r) {
 
 // Desde el semáforo: corregir la recepción de un lote (si llegó en varias entregas, se elige cuál).
 async function editarIngresoLote(l) {
+  let campoMotivo;
   const [cat, recs] = await Promise.all([api('/bodega/catalogo'), api('/lotes/' + l.id + '/recepciones')]);
   if (!recs.length) throw new Error('Este lote no tiene una recepción de bodega principal para corregir.');
   let r = recs[0];
   if (recs.length > 1) {
-    r = await modal('¿Qué entrega quieres corregir?', h('div', null,
+    // Cada entrega se puede corregir o eliminar (se anula con su motivo; las demás entregas del lote siguen igual).
+    r = await modal('¿Qué entrega quieres corregir?', (cerrar) => h('div', null,
       h('p', { style: 'margin-top:0' }, h('b', null, l.producto_bodega || l.ingrediente), ' | ', h('b', { class: 'mono' }, l.lote),
-        ' llegó en ' + recs.length + ' entregas.')),
-    recs.map((x) => ({ texto: dia(x.fecha_ingreso) + ' · ' + [x.cantidad, x.unidad].filter(Boolean).join(' ') + (x.caducidad ? ' · cad. ' + dia(x.caducidad) : ' · sin caducidad'), valor: x }))
-      .concat([{ texto: 'Cancelar', valor: null }]));
+        ' llegó en ' + recs.length + ' entregas.'),
+      recs.map((x) => h('div', { class: 'fila-entrega' },
+        h('button', { class: 'boton', type: 'button', onclick: () => cerrar(x) },
+          dia(x.fecha_ingreso) + ' · ' + [x.cantidad, x.unidad].filter(Boolean).join(' ') + (x.caducidad ? ' · cad. ' + dia(x.caducidad) : ' · sin caducidad')),
+        h('button', { class: 'boton peligro', type: 'button', title: 'Eliminar esta entrega', onclick: () => cerrar({ eliminar: x }) }, 'Eliminar')))),
+    [{ texto: 'Cancelar', valor: null }]);
     if (!r) return false;
+    if (r.eliminar) {
+      const x = r.eliminar;
+      const motivo = await modal('Eliminar la entrega del ' + dia(x.fecha_ingreso), h('div', null,
+        h('p', { style: 'margin-top:0' }, h('b', null, l.producto_bodega || l.ingrediente), ' | ', h('b', { class: 'mono' }, l.lote), ' · ',
+          [x.cantidad, x.unidad].filter(Boolean).join(' '), '. Queda en el registro como ', h('b', null, 'anulada'), ', con su motivo; la otra entrega sigue igual.'),
+        h('label', null, 'Motivo (queda registrado)'), campoMotivo = h('input', { type: 'text', placeholder: 'ej. se registró dos veces' })),
+      [{ texto: 'Eliminar entrega', clase: 'peligro-lleno', accion: async () => {
+          const m = campoMotivo.value.trim();
+          if (!m) throw new Error('Escribe el motivo.');
+          await api('/recepciones/' + x.id + '/anular', { motivo: m });
+          return true;
+        } }, { texto: 'Cancelar', valor: null }]);
+      if (!motivo) return false;
+      avisar('Entrega del ' + dia(x.fecha_ingreso) + ' eliminada', 'bien');
+      return true;
+    }
   }
   return corregirRecepcion(cat, r);
 }
