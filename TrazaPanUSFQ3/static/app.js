@@ -109,6 +109,32 @@ const NOMBRE_ESTADO = { en_curso: 'En curso', por_completar: 'Por completar', co
 const CLASE_ESTADO = { en_curso: 'aviso', por_completar: 'rojo', completa: 'verde', anulada: 'gris' };
 
 const num = (x) => String(Math.round(Number(x) * 1000) / 1000);
+// Empaques: se registra en paquetes, cubetas, botellas... y la app muestra lo que equivale (kg, litros, huevos).
+const nombreEmpaque = (e, n) => { const s = String(e || '').toLowerCase(); return Number(n) === 1 ? (s === 'bidon' ? 'bidón' : s) : (s === 'bidon' ? 'bidones' : s + 's'); };
+const cuantos = (e) => (['CUBETA', 'FUNDA', 'BOTELLA', 'CAJA'].includes(e) ? '¿Cuántas ' : '¿Cuántos ') + nombreEmpaque(e, 2);
+const unidadDe = (l, n) => (l && l.empaque ? nombreEmpaque(l.empaque, n) : (l && l.unidad) || 'unidades');
+function equivalencia(cant, e) {
+  if (!e || !e.empaque || !e.contenido || cant === '' || cant == null || isNaN(Number(cant))) return '';
+  let total = Number(cant) * e.contenido, u = e.unidad_contenido;
+  if (u === 'g' && total >= 1000) { total /= 1000; u = 'kg'; }
+  if (u === 'ml' && total >= 1000) { total /= 1000; u = 'lt'; }
+  return num(total) + ' ' + u;
+}
+const textoEmpaque = (e) => (e && e.empaque ? '1 ' + nombreEmpaque(e.empaque, 1) + ' = ' + num(e.contenido) + ' ' + e.unidad_contenido : '');
+// "3 paquetes (150 kg)"
+const cantidadLote = (n, l) => num(n) + ' ' + unidadDe(l, n) + (l && l.empaque && equivalencia(n, l) ? ' (' + equivalencia(n, l) + ')' : '');
+// Campo de cantidad en empaques: solo enteros y debajo lo que equivale.
+function campoEmpaques(l, valor, alCambiar, placeholder) {
+  const eq = h('div', { class: 'chico equivale' });
+  const pintarEq = (v) => { eq.textContent = l.empaque && v ? '= ' + equivalencia(v, l) : ''; };
+  const campo = h('input', { type: 'text', inputmode: l.empaque ? 'numeric' : 'decimal', autocomplete: 'off', value: valor || '', placeholder: placeholder || 'ej. 2',
+    oninput: (ev) => {
+      if (l.empaque) { const v = ev.target.value.replace(/\D/g, ''); if (v !== ev.target.value) ev.target.value = v; }
+      pintarEq(ev.target.value); alCambiar(ev.target.value);
+    } });
+  pintarEq(valor);
+  return { campo, eq };
+}
 
 // Semáforo de caducidad: rojo = caducado, amarillo = por caducar, verde = con buen tiempo. El texto dice lo mismo que el color.
 function semaforo(l) {
@@ -123,7 +149,7 @@ function semaforo(l) {
 // Dar de baja un lote (o parte) por caducado o contaminado. lugar: principal, secundaria o cocina.
 // disponible: lo que queda en ese lugar (se propone darlo todo de baja); en cocina la cantidad es opcional.
 async function darDeBaja(l, lugar, disponible) {
-  const u = l.unidad || 'unidades';
+  const u = unidadDe(l, 2);
   // En bodega secundaria también: "Registrado por error" (el lote no llegó; vuelve a bodega principal).
   const opciones = [['CADUCADO', 'Caducado'], ['CONTAMINADO', 'Contaminado']].concat(lugar === 'secundaria' ? [['ERROR', 'Registrado por error']] : []);
   let bloqueCantidad = null, notaError = null;
@@ -142,7 +168,7 @@ async function darDeBaja(l, lugar, disponible) {
     notaError = h('p', { class: 'nota', hidden: true }, 'El lote sale de bodega secundaria y vuelve a quedar en bodega principal, como si nunca hubiera pasado.'),
     bloqueCantidad = h('div', null,
       h('label', null, '¿Cuántas ' + u + ' se sacan de ' + nombres[lugar] + '?'), cantidad,
-      disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + num(Math.max(disponible, 0)) + ' ' + u + '.') : null,
+      disponible != null ? h('div', { class: 'chico suave' }, 'En ' + nombres[lugar] + ' quedan ' + cantidadLote(Math.max(disponible, 0), l) + '.') : null,
       h('label', null, 'Comentario'), comentario)),
   [{ texto: 'Dar de baja', clase: 'peligro-lleno', valor: () => ({ lote_id: l.id, lugar, motivo: motivo.valor, cantidad: cantidad.value.trim(), comentario: comentario.value.trim() }) },
     { texto: 'Cancelar', valor: null }]);
@@ -170,13 +196,12 @@ function leyendaSemaforo(lotes) {
 }
 // nombre y lote en negrilla; cantidad disponible y proveedor; caducidad con su color.
 function tarjetaSemaforo(l, nombre, disponible, acciones, foto) {
-  const u = l.unidad ? ' ' + l.unidad : '';
   return h('div', { class: 'lote borde-' + (l.semaforo || 'sin') },
     foto !== undefined ? fotoProducto(foto, nombre, 'en-lote') : null,
     h('div', { class: 'datos' },
       h('div', { class: 'titulo-lote' }, h('b', null, nombre), h('span', { class: 'separador' }, '|'), h('b', { class: 'mono' }, l.lote)),
       h('div', { class: 'chico' }, disponible === false ? h('span', { class: 'suave' }, l.fecha_ingreso ? 'Ingresó ' + dia(l.fecha_ingreso) : '')
-        : disponible != null ? ['Quedan ', h('b', null, num(Math.max(disponible, 0)) + u)] : h('span', { class: 'suave' }, 'Cantidad sin registrar'),
+        : disponible != null ? ['Quedan ', h('b', null, cantidadLote(Math.max(disponible, 0), l))] : h('span', { class: 'suave' }, 'Cantidad sin registrar'),
         l.proveedor ? h('span', { class: 'suave' }, (disponible === false && !l.fecha_ingreso ? '' : ' · ') + l.proveedor) : null),
       h('div', null, semaforo(l) || h('span', { class: 'etq gris' }, 'Sin fecha de caducidad'))),
     acciones ? h('div', { class: 'acciones-lote' }, acciones) : null);
@@ -189,23 +214,24 @@ function buscadorLotes(caja, valor, alCambiar) {
 
 function tarjetaLote(l, opc) {
   opc = opc || {};
-  const u = l.unidad ? ' ' + l.unidad : '';
+  const cu = (x) => cantidadLote(x, l);
   const cad = l.caducidad && !l.semaforo ? 'caduca ' + dia(l.caducidad) : null;     // si hay semáforo, la fecha va ahí
-  const detalle = opc.cocina ? (l.disponible_cocina != null ? 'Quedan ' + num(Math.max(l.disponible_cocina, 0)) + u + ' en bodega secundaria' : '')
+  const detalle = opc.cocina ? (l.disponible_cocina != null ? 'Quedan ' + cu(Math.max(l.disponible_cocina, 0)) + ' en bodega secundaria' : '')
     : opc.breve ? [l.producto_bodega, l.proveedor, cad,
-    opc.saldo && l.disponible != null ? 'quedan ' + num(Math.max(l.disponible, 0)) + u : null].filter((x, i) => x && !(opc.saldo && i === 0)).join(' · ')
+    opc.saldo && l.disponible != null ? 'quedan ' + cu(Math.max(l.disponible, 0)) : null].filter((x, i) => x && !(opc.saldo && i === 0)).join(' · ')
     : [l.producto_bodega, l.proveedor, l.fecha_ingreso && 'ingresó ' + dia(l.fecha_ingreso),
-    l.recibido != null ? 'recibido ' + num(l.recibido) + u : l.cantidad,
-    l.trasladado ? 'pasó a secundaria ' + num(l.trasladado) + u : null,
-    l.disponible != null && !l.principal_vacio && (l.trasladado || l.a_cocina) ? 'quedan en principal ' + num(l.disponible) + u : null,
-    l.disponible_cocina != null ? 'quedan en secundaria ' + num(Math.max(l.disponible_cocina, 0)) + u : null,
-    l.a_cocina ? 'tomado por cocina ' + num(l.a_cocina) + u : null,
+    l.recibido != null ? 'recibido ' + cu(l.recibido) : l.cantidad,
+    l.trasladado ? 'pasó a secundaria ' + cu(l.trasladado) : null,
+    l.disponible != null && !l.principal_vacio && (l.trasladado || l.a_cocina) ? 'quedan en principal ' + cu(l.disponible) : null,
+    l.disponible_cocina != null ? 'quedan en secundaria ' + cu(Math.max(l.disponible_cocina, 0)) : null,
+    l.a_cocina ? 'tomado por cocina ' + cu(l.a_cocina) : null,
     cad].filter(Boolean).join(' · ');
   const el = h('div', { class: 'lote' + (opc.elegible ? ' elegible' : '') + (opc.marcado ? ' marcado' : '') },
     opc.elegible ? h('div', { class: 'caja' }, opc.marcado ? '✓' : '') : null,
     h('div', { class: 'datos' },
       opc.conIngrediente ? h('div', { class: 'chico suave' }, l.ingrediente) : null,
-      h('div', { class: 'codigo' }, l.lote),
+      h('div', { class: 'codigo' }, l.lote, l.foto_recepcion ? h('button', { class: 'boton-enlace ver-etiqueta', type: 'button',
+        onclick: (e) => { e.stopPropagation(); verFoto('/fotos/' + l.foto_recepcion, 'Lote ' + l.lote); } }, '📷 Ver etiqueta') : null),
       detalle ? h('div', { class: 'chico suave' }, detalle) : null,
       opc.cocina ? h('div', null, semaforo(l)) : h('div', null,
         semaforo(l), ' ',
@@ -337,7 +363,21 @@ function campoFoto() {
   botones.append(
     h('button', { class: 'boton', type: 'button', onclick: abrirCamara }, '📷 Tomar foto'),
     h('button', { class: 'boton', type: 'button', onclick: () => subir.click() }, 'Subir archivo'));
-  return { el: h('div', null, botones, zonaCamara, vista, subir, camaraCel), get archivo() { return archivo; }, apagar };
+  return { el: h('div', null, botones, zonaCamara, vista, subir, camaraCel), get archivo() { return archivo; }, apagar,
+    limpiar: () => { archivo = null; vista.hidden = true; apagar(); } };
+}
+// Ver una foto guardada (etiqueta del lote, requisición).
+function verFoto(url, titulo) {
+  return modal(titulo, h('div', { class: 'ver-foto' }, h('img', { src: url, alt: titulo }),
+    h('a', { class: 'boton chico', href: url, target: '_blank', rel: 'noopener' }, 'Abrir en grande')), [{ texto: 'Cerrar', valor: null }]);
+}
+// Sube las fotos elegidas de una recepción.
+async function subirFotosRecepcion(id, fotos) {
+  for (const [tipo, f] of Object.entries(fotos)) {
+    if (!f.archivo) continue;
+    const resp = await fetch('/api/recepciones/' + id + '/foto?tipo=' + tipo + '&persona=' + encodeURIComponent(quien()), { method: 'POST', body: f.archivo });
+    if (!resp.ok) { const r = await resp.json().catch(() => ({})); throw new Error('La recepción se guardó, pero la foto no: ' + (r.error || 'error')); }
+  }
 }
 
 // "No encuentro el lote en la lista"
@@ -396,8 +436,8 @@ function pintar(...nodos) { llenar($vista, ...nodos); window.scrollTo(0, 0); }
 // Areas de trabajo. Cada dispositivo recuerda su area; mas adelante cada area tendra su contrasena.
 const AREAS = {
   bodega: { nombre: 'Bodega principal', texto: 'Recepción de proveedores e inventario', secciones: ['bodega', 'inventario'] },
-  produccion: { nombre: 'Producción', texto: 'Bodega secundaria, hojas de producción, etiquetas, consultas y administración',
-    secciones: ['secundaria', 'hojas', 'etiquetas', 'consulta', 'admin'] },
+  produccion: { nombre: 'Producción', texto: 'Bodega secundaria, hojas de producción, etiquetas, despachos, consultas y administración',
+    secciones: ['secundaria', 'hojas', 'etiquetas', 'despachos', 'consulta', 'admin'] },
   cocina: { nombre: 'Cocina', texto: 'Abrir lotes y avisar qué pan empieza y termina', secciones: ['cocina', 'produccion'] },
 };
 let areaMemoria = '';
@@ -500,6 +540,8 @@ async function vistaInicio() {
     hojas: () => mosaico('#/hojas', 'Hojas de producción', 'Ver lo que se está produciendo y completar las hojas',
       e.por_completar ? e.por_completar + ' por completar' : 0, 'rojo'),
     etiquetas: () => mosaico('#/etiquetas', 'Etiquetas', 'Lotes del día para imprimir en la Zebra'),
+    despachos: () => mosaico('#/despachos', 'Despachos', 'Registrar a dónde sale cada lote de pan',
+      e.congelador ? e.congelador + ' en congelador' : 0, 'verde'),
     consulta: () => mosaico('#/consulta', 'Consultar', 'Rastrear un lote de pan o de ingrediente'),
     admin: () => mosaico('#/admin', 'Administrar', 'Importar Excel, pendientes, recetas y personas', pendientes, 'rojo'),
   };
@@ -661,21 +703,56 @@ function formRecepcion(cat, ini, editar) {
     opciones: () => cat.productos, texto: (p) => p.producto, foto: (p) => p.foto, placeholder: 'Toca para ver los productos o escribe parte del nombre',
     vacio: 'No está en la lista.', aviso: 'Elige un producto de la lista (o agrégalo como producto nuevo).', alAgregar: () => nuevoProducto(),
     alElegir: (p) => {
-      if (!unidad.elegido && p.unidad && cat.unidades.includes(p.unidad)) unidad.elegir(p.unidad);
+      ponerEmpaque(p);
+      if (!p.empaque && !unidad.elegido && p.unidad && cat.unidades.includes(p.unidad)) unidad.elegir(p.unidad);
     },
   });
   if (prod) c.producto = prod.input;
+  // Con empaque definido (1 paquete = 50 kg) la unidad es fija y la cantidad se cuenta en empaques enteros.
+  let emp = null;
+  const unidadFija = h('div', { class: 'unidad-fija', hidden: true });
+  const cajaUnidadLibre = h('div', null, unidad.el, unidad.aviso,
+    h('button', { class: 'boton-enlace', type: 'button', onclick: () => nuevaUnidad() }, '+ Agregar unidad nueva'));
+  const eqCantidad = h('div', { class: 'chico equivale' });
+  const pintarEq = () => { eqCantidad.textContent = emp && c.cantidad.value ? '= ' + equivalencia(c.cantidad.value, emp) : ''; };
+  // La unidad nunca se escribe: sale del empaque del producto (Administrar > Productos de bodega > Empaque).
+  const ponerEmpaque = (p) => {
+    emp = p && p.empaque ? p : null;
+    unidadFija.hidden = false;
+    unidadFija.classList.toggle('vacia', !emp);
+    unidadFija.replaceChildren(...(emp ? [h('b', null, nombreEmpaque(emp.empaque, 2).toUpperCase()), h('span', { class: 'chico suave' }, textoEmpaque(emp))]
+      : editar && ini.unidad ? [h('b', null, ini.unidad)]
+        : p ? [h('span', { class: 'chico', style: 'color:var(--alerta)' }, 'Este producto no tiene empaque. Defínelo en Administrar > Productos de bodega.')]
+          : [h('span', { class: 'chico suave' }, 'Se pone sola al elegir el producto')]));
+    c.cantidad.placeholder = emp ? 'Número de ' + nombreEmpaque(emp.empaque, 2) : 'Solo números';
+    c.cantidad.inputMode = emp ? 'numeric' : 'decimal';
+    pintarEq();
+  };
+  c.cantidad.addEventListener('input', () => {
+    if (emp) { const v = c.cantidad.value.replace(/\D/g, ''); if (v !== c.cantidad.value) c.cantidad.value = v; }
+    pintarEq();
+  });
   const nuevoProducto = () => intentar(async () => {
     const campo = campoMayusculas(prod.elegido ? '' : c.producto.value.trim());
     const foto = campoFoto();
+    // Cuánto trae un empaque: así todos registran en paquetes y la app calcula los kg, litros o unidades.
+    const empaque = h('select', null, cat.empaques.map((e) => h('option', { value: e }, nombreEmpaque(e, 1))));
+    const contenido = h('input', { type: 'text', inputmode: 'decimal', placeholder: 'ej. 1', style: 'width:6rem',
+      oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; } });
+    const unidadC = h('select', null, cat.unidades_contenido.map((u) => h('option', { value: u }, u)));
     setTimeout(() => campo.focus(), 50);
-    const nombre = await modal('Agregar producto nuevo a la lista', h('div', null,
+    const datos = await modal('Agregar producto nuevo a la lista', h('div', null,
       h('label', null, 'Nombre del producto (por ejemplo: CHOCOLATE COBERTURA (1KG))'), campo,
+      h('label', null, '¿Cuánto trae cada empaque?'),
+      h('div', { class: 'en-linea empaque-linea' }, h('b', null, '1'), empaque, h('b', null, '='), contenido, unidadC),
+      h('div', { class: 'chico suave' }, 'Ejemplo: 1 botella = 500 ml · 1 paquete = 50 kg · 1 cubeta = 30 huevos'),
       h('label', null, 'Foto del producto (opcional)'), foto.el),
-    [{ texto: 'Agregar', clase: 'principal', valor: () => campo.value.trim().toUpperCase() }, { texto: 'Cancelar', valor: null }]);
+    [{ texto: 'Agregar', clase: 'principal', valor: () => ({ nombre: campo.value.trim().toUpperCase(), empaque: empaque.value,
+      contenido: contenido.value.trim(), unidad_contenido: unidadC.value }) }, { texto: 'Cancelar', valor: null }]);
     foto.apagar();
-    if (!nombre) return;
-    const r = await api('/bodega/productos', { nombre });
+    if (!datos || !datos.nombre) return;
+    if (!datos.contenido) throw new Error('Escribe cuánto trae cada ' + nombreEmpaque(datos.empaque, 1) + '.');
+    const r = await api('/bodega/productos', datos);
     if (foto.archivo) {
       try { await subirFotoProducto(r.id, foto.archivo); } catch (e) { avisar('El producto se agregó, pero la foto no se pudo guardar: ' + e.message); }
     }
@@ -695,35 +772,83 @@ function formRecepcion(cat, ini, editar) {
   });
 
   const campo = (etiqueta, nodo, clase) => h('div', { class: 'campo ' + (clase || '') }, h('label', null, etiqueta), nodo);
+  const fotos = { lote: campoFoto(), requisicion: campoFoto() };
   const el = h('div', { class: 'form-recepcion' },
     campo('Fecha de ingreso', c.fecha),
     campo('Producto', editar ? c.producto : [prod.el, prod.aviso,
       h('button', { class: 'boton-enlace', type: 'button', onclick: nuevoProducto }, '+ Agregar producto nuevo')], 'doble'),
     campo('Proveedor', c.proveedor, 'ancho-movil'),
     campo('Lote', [c.lote, editar && ini.en_uso ? h('div', { class: 'chico suave' }, 'Ya se usó en panadería: no se puede cambiar.') : null], 'doble'),
-    campo('Cantidad', c.cantidad),
-    campo('Unidad de medida', [unidad.el, unidad.aviso,
-      h('button', { class: 'boton-enlace', type: 'button', onclick: nuevaUnidad }, '+ Agregar unidad nueva')]),
+    campo('Cantidad', [c.cantidad, eqCantidad]),
+    campo('Unidad de medida', unidadFija),
     campo('Apariencia visual del producto', apariencia.el), campo('Condiciones de transporte', transporte.el),
     campo('Aprobado por', c.aprobado), campo('Fecha de caducidad', c.caducidad),
     h('div', { class: 'campo completo' }, cajaDecision),
-    campo('Observaciones', c.observaciones, 'completo'));
+    campo('Observaciones', c.observaciones, 'completo'),
+    h('div', { class: 'campo completo fotos-recepcion' },
+      h('div', null, h('label', null, 'Foto del lote (etiqueta del empaque)'),
+        editar && ini.foto_lote ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + ini.foto_lote, 'Lote ' + ini.lote_texto) }, 'Ver la foto guardada (puedes reemplazarla)') : null,
+        fotos.lote.el),
+      h('div', null, h('label', null, 'Foto de la requisición'),
+        editar && ini.foto_requisicion ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + ini.foto_requisicion, 'Requisición') }, 'Ver la foto guardada (puedes reemplazarla)') : null,
+        fotos.requisicion.el)));
 
+  ponerEmpaque(editar ? cat.productos.find((p) => p.producto === ini.producto) || null : null);
   const leer = () => ({
     fecha: c.fecha.value, producto: editar ? ini.producto : (prod.elegido ? prod.elegido.producto : ''), proveedor: c.proveedor.value.trim(), lote: c.lote.value.trim(),
-    cantidad: c.cantidad.value.trim(), unidad: unidad.elegido || '', caducidad: c.caducidad.value,
+    cantidad: c.cantidad.value.trim(), unidad: emp ? emp.empaque : (editar ? ini.unidad || '' : ''), caducidad: c.caducidad.value,
     apariencia: apariencia.valor, transporte: transporte.valor, decision: algoMal() ? decision.valor : '',
     aprobado_por: c.aprobado.value.trim(), observaciones: c.observaciones.value.trim(),
   });
   const limpiar = (mismoProducto) => {
     c.lote.value = ''; c.cantidad.value = ''; c.caducidad.value = ''; c.observaciones.value = ''; decision.valor = '';
+    fotos.lote.limpiar();
+    if (!mismoProducto) fotos.requisicion.limpiar();      // otro lote de la misma entrega: la requisición es la misma
     if (!mismoProducto) {
       prod.limpiar(); unidad.limpiar(); c.proveedor.value = ''; apariencia.valor = ''; transporte.valor = '';
+      ponerEmpaque(null);
     }
+    pintarEq();
     revisar();
     if (mismoProducto) c.lote.focus();
   };
-  return { el, leer, limpiar };
+  return { el, leer, limpiar, fotos };
+}
+
+// Corregir una recepción de bodega principal (fecha, proveedor, cantidad, caducidad, etc.). El motivo queda en el historial.
+async function corregirRecepcion(cat, r) {
+  const f = formRecepcion(cat, r, true);
+  const motivo = h('input', { type: 'text', placeholder: !r.caducidad ? 'Opcional si solo agregas la caducidad' : 'ej. la cantidad estaba mal escrita' });
+  const datos = await modal('Corregir recepción', h('div', null, f.el, h('label', null, 'Motivo de la corrección (queda registrado)'), motivo),
+    [{ texto: 'Guardar corrección', clase: 'principal', valor: () => Object.assign(f.leer(), { motivo: motivo.value.trim() }) },
+      { texto: 'Cancelar', valor: null }]);
+  Object.values(f.fotos).forEach((x) => x.apagar());
+  if (!datos) return false;
+  const conFotos = Object.values(f.fotos).some((x) => x.archivo);
+  await subirFotosRecepcion(r.id, f.fotos);
+  try {
+    await api('/recepciones/' + r.id + '/editar', datos);
+  } catch (e) {
+    if (!(conFotos && /No cambiaste nada/.test(e.message))) throw e;      // solo se agregó una foto
+  }
+  avisar(conFotos ? 'Guardado (con foto)' : 'Corrección guardada', 'bien');
+  return true;
+}
+
+// Desde el semáforo: corregir la recepción de un lote (si llegó en varias entregas, se elige cuál).
+async function editarIngresoLote(l) {
+  const [cat, recs] = await Promise.all([api('/bodega/catalogo'), api('/lotes/' + l.id + '/recepciones')]);
+  if (!recs.length) throw new Error('Este lote no tiene una recepción de bodega principal para corregir.');
+  let r = recs[0];
+  if (recs.length > 1) {
+    r = await modal('¿Qué entrega quieres corregir?', h('div', null,
+      h('p', { style: 'margin-top:0' }, h('b', null, l.producto_bodega || l.ingrediente), ' | ', h('b', { class: 'mono' }, l.lote),
+        ' llegó en ' + recs.length + ' entregas.')),
+    recs.map((x) => ({ texto: dia(x.fecha_ingreso) + ' · ' + [x.cantidad, x.unidad].filter(Boolean).join(' ') + (x.caducidad ? ' · cad. ' + dia(x.caducidad) : ' · sin caducidad'), valor: x }))
+      .concat([{ texto: 'Cancelar', valor: null }]));
+    if (!r) return false;
+  }
+  return corregirRecepcion(cat, r);
 }
 
 async function vistaBodega() {
@@ -773,22 +898,15 @@ async function vistaBodega() {
     h('td', null, r.aprobado_por),
     h('td', null, r.anulado ? h('span', { class: 'etq gris' }, 'ANULADA: ' + r.motivo_anulacion) : null,
       r.rechazado ? h('span', { class: 'etq rojo' }, 'RECHAZADO') : null, ' ', r.observaciones,
-      r.nota ? h('div', { class: 'chico suave no-imprimir' }, r.nota) : null),
+      r.nota ? h('div', { class: 'chico suave no-imprimir' }, r.nota) : null,
+      r.foto_lote || r.foto_requisicion ? h('div', { class: 'fotos-fila no-imprimir' },
+        r.foto_lote ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + r.foto_lote, 'Lote ' + r.lote_texto) }, '📷 Lote') : null,
+        r.foto_requisicion ? h('button', { class: 'boton-enlace', type: 'button', onclick: () => verFoto('/fotos/' + r.foto_requisicion, 'Requisición · ' + r.producto) }, '📄 Requisición') : null) : null),
     h('td', { class: 'no-imprimir' }, r.anulado ? null : h('div', { style: 'display:flex;gap:.3rem;flex-wrap:wrap' },
       h('button', { class: 'boton chico', type: 'button', onclick: () => corregir(r) }, 'Corregir'),
       h('button', { class: 'boton chico peligro', type: 'button', onclick: () => anular(r) }, 'Anular'))));
 
-  const corregir = (r) => intentar(async () => {
-    const f = formRecepcion(cat, r, true);
-    const motivo = h('input', { type: 'text', placeholder: 'ej. la cantidad estaba mal escrita' });
-    const datos = await modal('Corregir recepción', h('div', null, f.el, h('label', null, 'Motivo de la corrección (queda registrado)'), motivo),
-      [{ texto: 'Guardar corrección', clase: 'principal', valor: () => Object.assign(f.leer(), { motivo: motivo.value.trim() }) },
-        { texto: 'Cancelar', valor: null }]);
-    if (!datos) return;
-    await api('/recepciones/' + r.id + '/editar', datos);
-    avisar('Corrección guardada', 'bien');
-    cargar();
-  });
+  const corregir = (r) => intentar(async () => { if (await corregirRecepcion(cat, r)) cargar(); });
   const anular = (r) => intentar(async () => {
     const motivo = await pedirTexto('Anular: ' + r.producto + ' · ' + r.lote_texto, 'Motivo (queda registrado)');
     if (!motivo) return;
@@ -806,6 +924,7 @@ async function vistaBodega() {
       if (!seguir) return;
     }
     const r = await api('/recepciones', d);
+    await subirFotosRecepcion(r.id, form.fotos);
     avisar('Guardado: ' + r.producto + ' · lote ' + r.lote_texto, 'bien');
     if (r.aviso) avisar(r.aviso);
     Object.assign(cat, await api('/bodega/catalogo'));
@@ -949,6 +1068,7 @@ async function vistaInventario(pestana) {
     llenar(caja, lotes.length ? leyendaSemaforo(lotes) : null,
       lotes.length > 6 ? buscadorLotes(caja, filtro, (v) => { filtro = v; pintarSem(); }) : null,
       lotes.length ? (visibles.length ? visibles.map((l) => tarjetaSemaforo(l, l.producto_bodega || l.ingrediente, false, [
+        h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => { if (await editarIngresoLote(l)) ir('semaforo'); }) }, 'Editar ingreso'),
         h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => { if (await darDeBaja(l, 'principal', null)) ir('semaforo'); }) }, 'Dar de baja')],
         fotoDe(l.producto_bodega))) : h('p', { class: 'suave' }, 'Ningún lote coincide con la búsqueda.'))
         : h('p', { class: 'suave' }, 'No hay lotes en bodega principal.'));
@@ -973,6 +1093,8 @@ async function vistaSecundaria(pestana) {
       enBodega.length ? leyendaSemaforo(enBodega) : null,
       enBodega.length > 6 ? buscadorLotes(cajaSec, filtro, (v) => { filtro = v; pintarSec(); }) : null,
       enBodega.length ? (visibles.length ? visibles.map((l) => tarjetaSemaforo(l, l.producto_bodega || l.ingrediente, l.disponible_cocina, [
+        l.semaforo ? null : h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+          if (await editarIngresoLote(l)) vistaSecundaria('semaforo'); }) }, 'Poner caducidad'),
         h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
           if (await darDeBaja(l, 'secundaria', l.disponible_cocina)) vistaSecundaria('semaforo'); }) }, 'Dar de baja')],
         (ings.find((i) => i.id === l.ingrediente_id) || {}).foto || null))
@@ -1006,12 +1128,12 @@ async function elegirIngreso(ing) {
   let enfocar = null;
   const bloqueCantidad = (l) => {
     const e = elegidos.get(l.id);
-    const u = l.unidad || 'unidades';
-    const campo = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: e.cantidad, placeholder: 'ej. 2',
-      oninput: (ev) => { e.cantidad = ev.target.value; } });
+    const { campo, eq } = campoEmpaques(l, e.cantidad, (v) => { e.cantidad = v; });
     if (enfocar === l.id) setTimeout(() => campo.focus(), 50);
     return h('div', { class: 'tarjeta', style: 'margin-top:-.3rem;border:2px solid var(--ok)' },
-      h('label', { style: 'margin-top:0' }, '¿Cuántas ' + u + ' de este lote pasan a bodega secundaria?'), campo,
+      h('label', { style: 'margin-top:0' }, l.empaque ? cuantos(l.empaque) + ' de este lote pasan a bodega secundaria?'
+        : '¿Cuánto de este lote pasa a bodega secundaria? (' + unidadDe(l, 2) + ')'), campo, eq,
+      l.disponible != null ? h('div', { class: 'chico suave' }, 'En bodega principal quedan ' + cantidadLote(Math.max(l.disponible, 0), l) + '.') : null,
       l.disponible != null
         ? null
         : h('label', { style: 'display:flex;gap:.5rem;align-items:center;font-weight:400' },
@@ -1147,17 +1269,16 @@ async function elegirApertura(ing) {
   const nRec = ing.recipientes || 0;
   const bloqueCantidad = (l) => {
     const e = elegidos.get(l.id);
-    const u = l.unidad || 'unidades';
-    const campo = h('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', value: e.cantidad, placeholder: 'ej. 1',
-      oninput: (ev) => { e.cantidad = ev.target.value; } });
+    const { campo, eq } = campoEmpaques(l, e.cantidad, (v) => { e.cantidad = v; }, 'ej. 1');
     if (enfocar === l.id) setTimeout(() => campo.focus(), 50);
     const rec = nRec > 1 ? segmento(Array.from({ length: nRec }, (_, i) => [String(i + 1), 'Recipiente ' + (i + 1)]),
       e.recipiente ? String(e.recipiente) : '', (v) => { e.recipiente = Number(v); }) : null;
     return h('div', { class: 'tarjeta', style: 'margin-top:-.3rem;border:2px solid var(--ok)' },
       rec ? [h('label', { style: 'margin-top:0' }, '¿En qué recipiente lo pones?'), rec.el] : null,
-      h('label', { style: rec ? '' : 'margin-top:0' }, '¿Cuántas ' + u + ' de este lote toma cocina?'), campo,
+      h('label', { style: rec ? '' : 'margin-top:0' }, l.empaque ? cuantos(l.empaque) + ' de este lote toma cocina?'
+        : '¿Cuánto de este lote toma cocina? (' + unidadDe(l, 2) + ')'), campo, eq,
       h('div', { class: 'chico suave' }, l.disponible_cocina != null
-        ? 'En ' + lugar + ' hay ' + num(l.disponible_cocina) + ' ' + u + '.'
+        ? 'En ' + lugar + ' hay ' + cantidadLote(l.disponible_cocina, l) + '.'
         : 'No se sabe cuánto hay en ' + lugar + ' de este lote (se pasó antes de registrar cantidades).'));
   };
   const dibujar = () => {
@@ -1685,6 +1806,280 @@ async function vistaEtiquetas() {
   contar();
 }
 
+
+// ------------------------------------------------------------------ despachos
+// Cada lote de pan con la hoja cerrada queda en el congelador con sus paquetes (1 etiqueta = 1 paquete).
+// El encargado de producción registra a qué destino sale cada lote: así la consulta sabe a quién avisar en un retiro.
+const nDespacho = (id) => 'N.º ' + String(id).padStart(4, '0');
+const plural = (n, uno, varios) => n + ' ' + (n === 1 ? uno : varios);
+let despachoEnCurso = { destino: null, cantidades: new Map(), fecha: '', obs: '' };
+
+async function editarDestino(d) {
+  d = d || {};
+  const campo = (valor, opc) => h('input', Object.assign({ type: 'text', value: valor || '' }, opc || {}));
+  const c = {
+    nombre: campoMayusculas(d.nombre), ruc: campo(d.ruc, { inputmode: 'numeric', placeholder: '10 o 13 números (opcional)' }),
+    contacto: campo(d.contacto, { placeholder: 'Quién recibe (opcional)' }), telefono: campo(d.telefono, { inputmode: 'tel', placeholder: 'Opcional' }),
+    correo: campo(d.correo, { type: 'email', placeholder: 'Opcional' }), direccion: campo(d.direccion, { placeholder: 'Opcional' }),
+    notas: campo(d.notas, { placeholder: 'Opcional' }),
+  };
+  c.ruc.addEventListener('input', (e) => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 13); });
+  setTimeout(() => c.nombre.focus(), 50);
+  const r = await modal(d.id ? 'Editar destino' : 'Nuevo destino', h('div', { class: 'form-destino' },
+    h('label', null, 'Nombre del destino o cliente *'), c.nombre,
+    h('div', { class: 'dos-col' },
+      h('div', null, h('label', null, 'RUC o cédula'), c.ruc), h('div', null, h('label', null, 'Teléfono'), c.telefono)),
+    h('div', { class: 'dos-col' },
+      h('div', null, h('label', null, 'Persona de contacto'), c.contacto), h('div', null, h('label', null, 'Correo'), c.correo)),
+    h('label', null, 'Dirección'), c.direccion, h('label', null, 'Notas'), c.notas),
+  [{ texto: d.id ? 'Guardar cambios' : 'Agregar destino', clase: 'principal', valor: () => Object.fromEntries(Object.entries(c).map(([k, el]) => [k, el.value.trim()])) },
+    { texto: 'Cancelar', valor: null }]);
+  if (!r) return null;
+  return api(d.id ? '/destinos/' + d.id : '/destinos', r);
+}
+
+function datosDestino(d) {
+  return [d.ruc && 'RUC/CI ' + d.ruc, d.contacto, d.telefono, d.correo, d.direccion].filter(Boolean).join(' · ');
+}
+
+async function bajaCongelador(l, motivos) {
+  const opciones = Object.entries(motivos).filter(([k]) => k !== 'ANTERIOR A LA APP');
+  const motivo = segmento(opciones, l.semaforo === 'rojo' ? 'CADUCADO' : '');
+  const cant = h('input', { type: 'text', inputmode: 'numeric', value: String(l.saldo), oninput: (e) => { e.target.value = e.target.value.replace(/\D/g, ''); } });
+  const comentario = h('input', { type: 'text', placeholder: 'Qué pasó (opcional)' });
+  const d = await modal('Dar de baja en el congelador', h('div', null,
+    h('p', { style: 'margin-top:0' }, h('b', null, l.producto), ' | ', h('b', { class: 'mono' }, l.lote_final), ' ', semaforo(l)),
+    h('label', null, 'Motivo'), motivo.el,
+    h('label', null, '¿Cuántos paquetes?'), cant, h('div', { class: 'chico suave' }, 'Quedan ' + plural(l.saldo, 'paquete', 'paquetes') + '.'),
+    h('label', null, 'Comentario'), comentario),
+  [{ texto: 'Dar de baja', clase: 'peligro-lleno', valor: () => ({ produccion_id: l.produccion_id, motivo: motivo.valor, paquetes: cant.value, comentario: comentario.value.trim() }) },
+    { texto: 'Cancelar', valor: null }]);
+  if (!d) return false;
+  if (!d.motivo) throw new Error('Elige el motivo.');
+  await api('/congelador/bajas', d);
+  avisar('Baja registrada', 'bien');
+  return true;
+}
+
+async function vistaDespachos(pestana, id) {
+  if (pestana === 'guia') return vistaGuiaDespacho(Number(id));
+  pestana = ['historial', 'destinos'].includes(pestana) ? pestana : 'despachar';
+  const ir = (p) => { history.replaceState(null, '', '#/despachos/' + p); vistaDespachos(p); };
+  const cuerpoP = h('div', null, h('p', { class: 'suave' }, 'Cargando…'));
+  pintar(encabezado('Despachos', 'A dónde sale cada lote de pan del congelador.'),
+    h('div', { class: 'pestanas' }, [['despachar', 'Despachar'], ['historial', 'Historial'], ['destinos', 'Destinos']].map(([p, nombre]) =>
+      h('button', { type: 'button', class: p === pestana ? 'activa' : '', onclick: () => ir(p) }, nombre))), cuerpoP);
+  if (pestana === 'despachar') return panelDespachar(cuerpoP);
+  if (pestana === 'historial') return panelHistorialDespachos(cuerpoP, 1);
+  return panelDestinos(cuerpoP);
+}
+
+async function panelDespachar(caja) {
+  const [estado, destinos, cong] = await Promise.all([api('/estado'), api('/destinos'), api('/congelador')]);
+  const st = despachoEnCurso;
+  if (!st.fecha || st.fecha > estado.hoy) st.fecha = estado.hoy;
+  if (st.destino && !destinos.some((d) => d.id === st.destino)) st.destino = null;
+  for (const k of [...st.cantidades.keys()]) if (!cong.lotes.some((l) => l.produccion_id === k)) st.cantidades.delete(k);
+  let filtro = '';
+  const cajaLotes = h('div', null);
+  const boton = h('button', { class: 'boton principal grande', type: 'button', onclick: () => intentar(registrar) });
+  const total = () => [...st.cantidades.values()].reduce((t, v) => t + (Number(v) || 0), 0);
+  const actualizarBoton = () => {
+    const n = total();
+    const dest = destinos.find((d) => d.id === st.destino);
+    boton.disabled = !dest || !n;
+    boton.textContent = !dest ? 'Elige a dónde va' : !n ? 'Escribe los paquetes que salen' : 'Registrar despacho a ' + dest.nombre + ' (' + plural(n, 'paquete', 'paquetes') + ')';
+  };
+  const fecha = h('input', { type: 'date', value: st.fecha, max: estado.hoy, onchange: (e) => { st.fecha = e.target.value; } });
+  const obs = h('input', { type: 'text', value: st.obs, placeholder: 'Opcional (ej. guía o factura, quién retiró)', oninput: (e) => { st.obs = e.target.value; } });
+
+  const filaLote = (l) => {
+    const campo = h('input', { type: 'text', inputmode: 'numeric', class: 'campo-paquetes', placeholder: '0', value: st.cantidades.get(l.produccion_id) || '',
+      'aria-label': 'Paquetes de ' + l.lote_final,
+      oninput: (e) => {
+        let v = e.target.value.replace(/\D/g, '');
+        if (v && Number(v) > l.saldo) { v = String(l.saldo); avisar('Del lote ' + l.lote_final + ' solo quedan ' + l.saldo + ' paquetes'); }
+        e.target.value = v;
+        if (v && Number(v) > 0) st.cantidades.set(l.produccion_id, v); else st.cantidades.delete(l.produccion_id);
+        tarjeta.classList.toggle('marcado', st.cantidades.has(l.produccion_id));
+        actualizarBoton();
+      } });
+    const todo = h('button', { class: 'boton chico', type: 'button', onclick: () => { campo.value = String(l.saldo); campo.dispatchEvent(new Event('input')); } }, 'Todo');
+    const tarjeta = h('div', { class: 'lote lote-cong borde-' + l.semaforo + (st.cantidades.has(l.produccion_id) ? ' marcado' : '') },
+      h('div', { class: 'datos' },
+        h('div', { class: 'titulo-lote' }, h('b', null, l.producto), h('span', { class: 'separador' }, '|'), h('b', { class: 'mono' }, l.lote_final)),
+        h('div', { class: 'chico' }, 'Quedan ', h('b', null, plural(l.saldo, 'paquete', 'paquetes')),
+          h('span', { class: 'suave' }, ' de ' + l.paquetes + ' · elaborado ' + dia(l.fecha))),
+        h('div', null, semaforo(l))),
+      h('div', { class: 'salen' }, h('label', null, 'Salen'), h('div', { class: 'salen-fila' }, campo, todo)),
+      h('div', { class: 'acciones-lote' }, h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+        if (await bajaCongelador(l, cong.motivos)) { st.cantidades.delete(l.produccion_id); vistaDespachos('despachar'); } }) }, 'Dar de baja')));
+    return tarjeta;
+  };
+  const pintarLotes = () => {
+    const n = normal(filtro);
+    const visibles = cong.lotes.filter((l) => !n || normal(l.producto + ' ' + l.lote_final).includes(n));
+    llenar(cajaLotes,
+      cong.lotes.length ? leyendaSemaforo(cong.lotes) : null,
+      cong.lotes.length > 6 ? buscadorLotes(cajaLotes, filtro, (v) => { filtro = v; pintarLotes(); }) : null,
+      cong.lotes.length ? (visibles.length ? visibles.map(filaLote) : h('p', { class: 'suave' }, 'Ningún lote coincide con la búsqueda.'))
+        : h('p', { class: 'suave' }, 'No hay pan en el congelador. Los lotes aparecen aquí cuando se cierra su hoja de producción.'));
+  };
+  const tarjetaDestino = (d) => h('button', { type: 'button', class: 'mosaico destino' + (st.destino === d.id ? ' elegido' : ''),
+    onclick: () => { st.destino = st.destino === d.id ? null : d.id; panelDespachar(caja); } },
+  h('b', null, d.nombre), datosDestino(d) ? h('small', null, datosDestino(d)) : null);
+
+  async function registrar() {
+    const dest = destinos.find((d) => d.id === st.destino);
+    const items = [...st.cantidades].map(([produccion_id, paquetes]) => ({ produccion_id, paquetes }));
+    const lotes = items.map((it) => ({ ...cong.lotes.find((l) => l.produccion_id === it.produccion_id), sale: it.paquetes }));
+    const ok = await modal('Confirmar despacho', h('div', null,
+      h('p', { style: 'margin-top:0' }, 'Destino: ', h('b', null, dest.nombre), h('br'), 'Fecha: ', h('b', null, dia(st.fecha))),
+      h('div', { class: 'tabla-caja' }, h('table', null, h('thead', null, h('tr', null, ['Lote', 'Producto', 'Paquetes'].map((t) => h('th', null, t)))),
+        h('tbody', null, lotes.map((l) => h('tr', null, h('td', { class: 'mono' }, h('b', null, l.lote_final)), h('td', null, l.producto), h('td', null, l.sale))),
+          h('tr', null, h('td', { colspan: '2' }, h('b', null, 'Total')), h('td', null, h('b', null, total()))))))),
+    [{ texto: 'Sí, registrar', clase: 'principal', valor: true }, { texto: 'Cancelar', valor: null }]);
+    if (!ok) return;
+    const r = await api('/despachos', { destino_id: dest.id, fecha: st.fecha, observaciones: st.obs.trim(), items });
+    despachoEnCurso = { destino: null, cantidades: new Map(), fecha: '', obs: '' };
+    avisar('Despacho ' + nDespacho(r.id) + ' registrado', 'bien');
+    location.hash = '#/despachos/guia/' + r.id;
+  }
+
+  const elegido = destinos.find((d) => d.id === st.destino);
+  llenar(caja,
+    h('h2', { style: 'margin-top:.4rem' }, '1. ¿A dónde va?'),
+    h('div', { class: 'rejilla rejilla-destinos' }, destinos.map(tarjetaDestino),
+      h('button', { type: 'button', class: 'mosaico destino nuevo', onclick: () => intentar(async () => {
+        const d = await editarDestino(); if (d) { st.destino = d.id; avisar('Destino agregado', 'bien'); panelDespachar(caja); } }) },
+      h('b', null, '+ Nuevo destino'), h('small', null, 'Punto de venta o cliente'))),
+    elegido ? h('div', { class: 'destino-elegido' }, h('span', null, 'Va a ', h('b', null, elegido.nombre)),
+      h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+        if (await editarDestino(elegido)) { avisar('Datos del cliente guardados', 'bien'); panelDespachar(caja); } }) }, 'Editar datos del cliente')) : null,
+    h('h2', null, '2. ¿Qué lotes salen? ', h('span', { class: 'num verde' }, cong.lotes.length)),
+    h('p', { class: 'chico suave' }, 'Escribe cuántos paquetes salen de cada lote. Un paquete = una etiqueta.'),
+    cajaLotes,
+    h('h2', null, '3. Datos del despacho'),
+    h('div', { class: 'en-linea' }, h('div', { style: 'max-width:220px' }, h('label', null, 'Fecha'), fecha), h('div', null, h('label', null, 'Observaciones'), obs)),
+    h('div', { class: 'fila-botones' }, boton),
+    cong.lotes.length && (cong.primer_uso || cong.lotes.some((l) => l.dias_caducidad < -30)) ? tarjetaPuestaEnMarcha(estado, () => vistaDespachos('despachar')) : null);
+  pintarLotes();
+  actualizarBoton();
+}
+
+// Solo al empezar a usar Despachos: los lotes viejos ya salieron sin registrarse.
+function tarjetaPuestaEnMarcha(estado, alTerminar) {
+  const hasta = h('input', { type: 'date', max: estado.hoy });
+  return h('div', { class: 'tarjeta chico', style: 'margin-top:1.4rem' }, h('b', null, 'Puesta en marcha: sacar lotes que ya salieron'),
+    h('p', { class: 'suave' }, 'Si empiezan a usar Despachos con lotes antiguos en la lista, quítalos de una vez. Quedan registrados como «salió antes de usar Despachos».'),
+    h('div', { class: 'en-linea' }, h('div', { style: 'max-width:220px' }, h('label', null, 'Elaborados hasta el'), hasta),
+      h('button', { class: 'boton', type: 'button', onclick: () => intentar(async () => {
+        if (!hasta.value) throw new Error('Elige la fecha.');
+        if (!await confirmar('Sacar lotes antiguos', 'Los lotes elaborados hasta el ' + dia(hasta.value) + ' salen de la lista del congelador.', 'Sí, sacarlos')) return;
+        const r = await api('/congelador/limpiar', { hasta: hasta.value });
+        avisar(plural(r.lotes, 'lote quitado', 'lotes quitados'), 'bien'); alTerminar();
+      }) }, 'Sacar de la lista')));
+}
+
+function tarjetaDespacho(d, alCambiar) {
+  return h('div', { class: 'tarjeta despacho' + (d.anulado ? ' anulado' : '') },
+    h('div', { class: 'despacho-cab' },
+      h('div', null, h('b', { class: 'despacho-num' }, nDespacho(d.id)), ' · ', h('b', null, d.destino), ' · ', dia(d.fecha), ' ',
+        d.anulado ? h('span', { class: 'etq gris' }, 'Anulado') : null,
+        h('div', { class: 'chico suave' }, plural(d.total, 'paquete', 'paquetes') + ' · registrado ' + hora(d.fecha_hora) + (d.persona ? ' · ' + d.persona : '')
+          + (d.observaciones ? ' · ' + d.observaciones : ''))),
+      h('div', { class: 'acciones-receta' },
+        h('a', { class: 'boton chico', href: '#/despachos/guia/' + d.id }, 'Guía'),
+        d.anulado ? null : h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+          const motivo = await pedirTexto('Anular el despacho ' + nDespacho(d.id), 'Motivo (queda registrado). Los paquetes vuelven al congelador.');
+          if (!motivo) return;
+          await api('/despachos/' + d.id + '/anular', { motivo }); avisar('Despacho anulado', 'bien'); alCambiar();
+        }) }, 'Anular'))),
+    h('div', { class: 'chips-despacho' }, d.lineas.map((li) => h('span', { class: 'chip-lote' }, h('b', { class: 'mono' }, li.lote_final), ' ' + li.producto + ' · ' + li.paquetes))),
+    d.anulado ? h('div', { class: 'chico', style: 'color:var(--alerta)' }, 'Anulado ' + hora(d.anulado_en) + ': ' + d.motivo_anulacion) : null);
+}
+
+async function panelHistorialDespachos(caja, pagina) {
+  const r = await api('/despachos?pagina=' + pagina);
+  llenar(caja,
+    h('div', { class: 'fila-botones' }, h('button', { class: 'boton', type: 'button', onclick: () => { location.href = '/api/despachos.xlsx'; } }, 'Descargar Excel de despachos')),
+    r.total ? [r.datos.map((d) => tarjetaDespacho(d, () => panelHistorialDespachos(caja, pagina))),
+      paginador(r.total, r.pagina, r.por_pagina, (n) => intentar(() => panelHistorialDespachos(caja, n)), 'Despachos')]
+      : h('p', { class: 'suave' }, 'Todavía no hay despachos.'));
+}
+
+async function panelDestinos(caja) {
+  const lista = await api('/destinos');
+  const recargar = () => panelDestinos(caja);
+  llenar(caja,
+    h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: () => intentar(async () => {
+      if (await editarDestino()) { avisar('Destino agregado', 'bien'); recargar(); } }) }, '+ Agregar destino')),
+    lista.length ? lista.map((d) => h('div', { class: 'tarjeta fila-destino' },
+      h('div', { class: 'datos' }, h('b', { class: 'nombre-destino' }, d.nombre),
+        h('div', { class: 'chico' }, datosDestino(d) || h('span', { class: 'suave' }, 'Sin datos de contacto')),
+        d.notas ? h('div', { class: 'chico suave' }, d.notas) : null,
+        h('div', { class: 'chico suave' }, d.n_despachos ? plural(d.n_despachos, 'despacho', 'despachos') + ' · último ' + dia(d.ultimo) : 'Sin despachos')),
+      h('div', { class: 'acciones-receta' },
+        h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+          if (await editarDestino(d)) { avisar('Destino guardado', 'bien'); recargar(); } }) }, 'Editar'),
+        h('button', { class: 'boton chico peligro', type: 'button', onclick: () => intentar(async () => {
+          if (!await confirmar('Eliminar ' + d.nombre, 'Ya no aparecerá para elegir. Sus despachos anteriores se conservan en el historial y en la consulta.', 'Sí, eliminar')) return;
+          await api('/destinos/' + d.id, { eliminar: true }); avisar('Destino eliminado', 'bien'); recargar(); }) }, 'Eliminar'))))
+      : h('p', { class: 'suave' }, 'No hay destinos. Agrega el primero.'));
+}
+
+async function vistaGuiaDespacho(id) {
+  const d = await api('/despachos/' + id);
+  const celda = (etq, valor) => h('td', null, h('div', { class: 'imp-etq' }, etq), h('div', { class: 'imp-valor' }, valor || '—'));
+  const impreso = h('div', { class: 'solo-imprimir hoja-impresa' },
+    h('table', { class: 'imp-cabecera' }, h('tbody', null, h('tr', null,
+      h('td', { class: 'imp-logo' }, h('img', { src: '/static/logo.png', alt: 'San Francisco FoodService' })),
+      h('td', { class: 'imp-titulo' }, h('div', null, 'GUÍA DE DESPACHO'), h('div', { class: 'imp-producto' }, 'Pan congelado')),
+      h('td', { class: 'imp-lote' }, h('div', { class: 'imp-etq' }, 'Número'), h('div', { class: 'imp-codigo' }, String(d.id).padStart(4, '0')))))),
+    d.anulado ? h('p', { class: 'imp-nota', style: 'color:#b00;font-weight:700' }, 'DESPACHO ANULADO: ' + d.motivo_anulacion) : null,
+    h('table', { class: 'imp-datos' }, h('tbody', null,
+      h('tr', null, celda('Fecha de despacho', dia(d.fecha)), celda('Destino / cliente', d.destino), celda('RUC / cédula', d.ruc), celda('Teléfono', d.telefono)),
+      h('tr', null, celda('Persona de contacto', d.contacto), h('td', { colspan: '2' }, h('div', { class: 'imp-etq' }, 'Dirección'), h('div', { class: 'imp-valor' }, d.direccion || '—')),
+        celda('Registrado', hora(d.fecha_hora))))),
+    h('div', { class: 'imp-sub' }, 'Lotes despachados'),
+    h('table', { class: 'imp-tabla' },
+      h('thead', null, h('tr', null, h('th', { style: 'width:7%' }, 'N.º'), h('th', { style: 'width:20%' }, 'Lote'), h('th', { style: 'width:33%' }, 'Producto'),
+        h('th', { style: 'width:14%' }, 'Elaboración'), h('th', { style: 'width:14%' }, 'Vence'), h('th', { style: 'width:12%' }, 'Paquetes'))),
+      h('tbody', null, d.lineas.map((li, i) => h('tr', null, h('td', { class: 'centro' }, String(i + 1)), h('td', { class: 'mono' }, li.lote_final), h('td', null, li.producto),
+        h('td', { class: 'centro' }, dia(li.fecha)), h('td', { class: 'centro' }, dia(li.caducidad)), h('td', { class: 'centro' }, String(li.paquetes)))),
+      h('tr', null, h('td', { colspan: '5', style: 'text-align:right;font-weight:700' }, 'TOTAL'), h('td', { class: 'centro', style: 'font-weight:800' }, String(d.total))))),
+    h('div', { class: 'imp-sub' }, 'Observaciones'),
+    h('div', { class: 'imp-observaciones' }, d.observaciones || ''),
+    h('table', { class: 'imp-firmas' }, h('tbody', null, h('tr', null,
+      h('td', null, h('div', { class: 'imp-linea' }), 'Entregado por', h('div', { class: 'imp-etq' }, 'Producción · panadería')),
+      h('td', null, h('div', { class: 'imp-linea' }), 'Recibido por', h('div', { class: 'imp-etq' }, 'Nombre, firma y hora'))))),
+    h('div', { class: 'imp-pie' }, 'TrazaPanUSFQ · San Francisco FoodService · impreso el ' + new Date().toLocaleString('es-EC')));
+  pintar(impreso, h('div', { class: 'no-imprimir' },
+    h('a', { class: 'volver', href: '#/despachos/historial' }, h('span', { class: 'flecha-volver', 'aria-hidden': 'true' }, '←'), 'Volver a Despachos'),
+    h('h1', null, 'Despacho ' + nDespacho(d.id)),
+    tarjetaDespacho(d, () => vistaGuiaDespacho(id)),
+    d.ruc || d.contacto || d.telefono || d.direccion ? h('p', { class: 'chico suave' }, datosDestino(d)) : null,
+    h('div', { class: 'fila-botones' },
+      h('button', { class: 'boton principal', type: 'button', onclick: () => window.print() }, 'Imprimir guía de despacho'),
+      h('a', { class: 'boton', href: '#/despachos/despachar' }, 'Nuevo despacho'))));
+}
+
+// Consulta: a dónde salió un lote de pan (para avisar en un retiro).
+function bloqueDespachos(p) {
+  if (!p.despachos) return null;
+  return h('div', { class: 'bloque-despachos' },
+    h('h3', null, 'A dónde se entregó'),
+    p.despachos.length ? h('div', { class: 'tabla-caja' }, h('table', null,
+      h('thead', null, h('tr', null, ['Fecha', 'Destino', 'Contacto', 'Paquetes', ''].map((t) => h('th', null, t)))),
+      h('tbody', null, p.despachos.map((e) => h('tr', null, h('td', null, dia(e.fecha)), h('td', null, h('b', null, e.destino)),
+        h('td', { class: 'chico' }, datosDestino(e) || '—'), h('td', null, e.paquetes),
+        h('td', null, h('a', { href: '#/despachos/guia/' + e.despacho_id, class: 'chico' }, nDespacho(e.despacho_id))))))))
+      : h('p', { class: 'suave chico' }, 'No tiene despachos registrados.'),
+    h('p', { class: 'chico' }, p.en_congelador > 0 ? ['Quedan en el congelador: ', h('b', null, plural(p.en_congelador, 'paquete', 'paquetes'))] : null,
+      p.bajas_congelador.length ? h('span', null, (p.en_congelador > 0 ? ' · ' : '') + 'Bajas: ' + p.bajas_congelador.map((b) =>
+        b.paquetes + ' ' + b.motivo_texto.toLowerCase() + ' (' + hora(b.fecha_hora) + ')').join('; ')) : null));
+}
+
 // ------------------------------------------------------------------ consulta
 function arbolProduccion(p) {
   if (p.armado) {
@@ -1722,7 +2117,7 @@ async function vistaConsulta() {
     const r = await api('/traza/final?lote=' + encodeURIComponent(campoPan.value));
     llenar(salida, h('h2', null, 'Pan ' + r.lote + ': de qué está hecho'),
       r.producciones.length ? h('div', null, r.producciones.length > 1 ? h('div', { class: 'nota' }, 'Hay ' + r.producciones.length + ' producciones con este mismo código de lote.') : null,
-        r.producciones.map(arbolProduccion)) : h('div', { class: 'nota rojo' }, 'No hay ninguna producción registrada con ese código.'));
+        r.producciones.map((p) => [arbolProduccion(p), bloqueDespachos(p)])) : h('div', { class: 'nota rojo' }, 'No hay ninguna producción registrada con ese código.'));
   });
   const buscarIng = () => intentar(async () => {
     const lotes = await api('/traza/ingrediente?q=' + encodeURIComponent(campoIng.value));
@@ -1733,11 +2128,17 @@ async function vistaConsulta() {
         l.foto ? h('p', null, h('a', { href: '/fotos/' + l.foto, target: '_blank' }, 'Ver foto del empaque')) : null,
         h('h3', null, 'Panes en los que se usó ', h('span', { class: 'num' + (l.usos.length ? ' rojo' : '') }, l.usos.length)),
         l.usos.length ? h('div', { class: 'tabla-caja' }, h('table', null,
-          h('thead', null, h('tr', null, ['Lote del pan', 'Producto', 'Fecha', 'Unidades', 'Cómo llegó'].map((t) => h('th', null, t)))),
+          h('thead', null, h('tr', null, ['Lote del pan', 'Producto', 'Fecha', 'Unidades', 'Cómo llegó', 'Entregado a'].map((t) => h('th', null, t)))),
           h('tbody', null, l.usos.map((u) => h('tr', null, h('td', { class: 'mono' }, h('a', { href: '#/hoja/' + u.produccion_id }, h('b', null, u.lote_final))),
             h('td', null, u.producto, u.es_subreceta ? h('span', { class: 'etq gris' }, 'subreceta') : null), h('td', null, dia(u.fecha)), h('td', null, u.unidades || '—'),
-            h('td', { class: 'chico' }, u.via.length ? 'a través de ' + u.via.join(' → ') : 'directo (' + u.renglon + ')'))))))
+            h('td', { class: 'chico' }, u.via.length ? 'a través de ' + u.via.join(' → ') : 'directo (' + u.renglon + ')'),
+            h('td', { class: 'chico' }, u.es_subreceta ? '—' : [u.despachos.map((e) => e.destino + ' (' + e.paquetes + ')').join(', ') || null,
+              u.en_congelador > 0 ? h('span', { class: 'suave' }, (u.despachos.length ? ' · ' : '') + u.en_congelador + ' en congelador') : null,
+              !u.despachos.length && !(u.en_congelador > 0) ? '—' : null]))))))
           : h('p', { class: 'suave' }, 'No aparece en ninguna hoja de producción.'),
+        l.destinos && l.destinos.length ? h('div', { class: 'nota destinos-avisar' }, h('b', null, 'Destinos que recibieron pan con este lote'),
+          l.destinos.map((e) => h('div', { class: 'chico' }, '• ', h('b', null, e.destino), ': ' + plural(e.paquetes, 'paquete', 'paquetes') + ' (' + e.lotes.join(', ') + ')'
+            + (datosDestino(e) ? ' · ' + datosDestino(e) : '')))) : null,
         l.salidas_areas && l.salidas_areas.length ? h('p', { class: 'chico' }, h('b', null, 'También salió de bodega principal a otras áreas: '),
           l.salidas_areas.map((o) => num(o.cantidad) + (o.unidad ? ' ' + o.unidad : '') + ' ' + (o.area === 'AJUSTE' ? 'cierre del lote (' + o.motivo + ')' : 'a ' + o.area)
             + ' el ' + hora(o.fecha_hora)).join('; ')) : null,
@@ -1803,7 +2204,18 @@ async function vistaAdmin(pestana) {
         }) }, 'Marcar como agotados'))),
     h('div', { class: 'tarjeta' }, h('h2', { style: 'margin-top:0' }, 'Respaldo'),
       h('p', { class: 'suave' }, 'Toda la información está en un solo archivo. Se guarda una copia automática por día en la carpeta datos/respaldos.'),
-      h('a', { class: 'boton', href: '/api/respaldo' }, 'Descargar copia de la base de datos')));
+      h('a', { class: 'boton', href: '/api/respaldo' }, 'Descargar copia de la base de datos')),
+    h('div', { class: 'tarjeta zona-peligro' }, h('h2', { style: 'margin-top:0' }, 'Empezar de cero'),
+      h('p', null, 'Borra ', h('b', null, 'recepciones, lotes, hojas de producción, etiquetas, despachos, inventarios, bajas e historial'), '.'),
+      h('p', { class: 'suave' }, 'Se conservan recetas, productos, ingredientes, productos de bodega, destinos y contraseñas. Antes de borrar se guarda una copia completa en datos/respaldos.'),
+      h('button', { class: 'boton peligro-lleno', type: 'button', onclick: () => intentar(async () => {
+        const t = await pedirTexto('Borrar todos los registros', 'No se puede deshacer desde la app. Escribe BORRAR para confirmar.');
+        if (t === null || t === undefined) return;
+        if (t.trim().toUpperCase() !== 'BORRAR') throw new Error('No se borró nada: había que escribir BORRAR.');
+        const r = await api('/admin/borrar-registros', { confirmacion: 'BORRAR' });
+        avisar('Listo: se borraron ' + r.recepciones + ' recepciones, ' + r.lotes + ' lotes y ' + r.hojas + ' hojas', 'bien');
+        recargar();
+      }) }, 'Borrar todos los registros')));
   }
 
   if (pestana === 'pendientes') {
@@ -1868,13 +2280,35 @@ async function vistaAdmin(pestana) {
 
   if (pestana === 'bodega') {
     const lista = await api('/alias');
+    const cat = await api('/bodega/catalogo');
+    // 1 PAQUETE = 50 kg: todos registran en paquetes y la app calcula lo demás.
+    const editarEmpaque = async (a) => {
+      const empaque = h('select', null, cat.empaques.map((e) => h('option', { value: e, selected: e === (a.empaque || 'PAQUETE') }, nombreEmpaque(e, 1))));
+      const contenido = h('input', { type: 'text', inputmode: 'decimal', value: a.contenido ? num(a.contenido) : '', placeholder: 'ej. 50',
+        oninput: (e) => { const v = soloNumero(e.target.value); if (v !== e.target.value) e.target.value = v; } });
+      const unidadC = h('select', null, cat.unidades_contenido.map((u) => h('option', { value: u, selected: u === (a.unidad_contenido || 'kg') }, u)));
+      setTimeout(() => contenido.focus(), 50);
+      const r = await modal('Empaque de ' + a.producto, h('div', null,
+        h('p', { class: 'chico suave', style: 'margin-top:0' }, 'Bodega principal, bodega secundaria y cocina registran en este empaque. La app calcula lo que equivale.'),
+        h('div', { class: 'en-linea empaque-linea' }, h('b', null, '1'), empaque, h('b', null, '='), contenido, unidadC),
+        a.empaque && a.recepciones ? h('p', { class: 'chico suave' }, 'Lo ya registrado en otra unidad (kg, unidades) se pasa a ' + nombreEmpaque(empaque.value, 2) + '.') : null),
+      [{ texto: 'Guardar', clase: 'principal', valor: () => ({ empaque: empaque.value, contenido: contenido.value, unidad_contenido: unidadC.value }) },
+        a.empaque ? { texto: 'Quitar empaque', clase: 'peligro', valor: () => ({ quitar: true }) } : null,
+        { texto: 'Cancelar', valor: null }].filter(Boolean));
+      if (!r) return false;
+      await api('/bodega/productos/' + a.id + '/empaque', r);
+      avisar(r.quitar ? 'Empaque quitado' : 'Empaque guardado', 'bien');
+      return true;
+    };
     // Producto de bodega: foto, nombre (el mismo en toda la app) y eliminar.
     const filaProducto = (a) => {
       return h('div', { class: 'tarjeta prod-bodega' },
         fotoProducto(a.foto, a.producto, 'prod-foto'),
         h('div', { class: 'prod-nombre' }, h('b', null, a.producto),
-          h('span', { class: 'chico suave' }, a.recepciones ? a.recepciones + ' recepción' + (a.recepciones === 1 ? '' : 'es') : 'Sin recepciones todavía')),
+          h('span', { class: 'chico suave' }, a.recepciones ? a.recepciones + (a.recepciones === 1 ? ' recepción' : ' recepciones') : 'Sin recepciones todavía'),
+          a.empaque ? h('span', { class: 'etq verde' }, textoEmpaque(a)) : h('span', { class: 'etq gris' }, 'Sin empaque')),
         h('div', { class: 'prod-acciones' },
+          h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => { if (await editarEmpaque(a)) recargar(); }) }, 'Empaque'),
           h('button', { class: 'boton chico', type: 'button', onclick: () => cambiarFoto(a) }, a.foto ? 'Cambiar foto' : 'Subir foto'),
           a.foto ? h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
             await api('/bodega/productos/' + a.id + '/foto/quitar', {}); recargar(); }) }, 'Quitar foto') : null,
@@ -2074,7 +2508,7 @@ async function navegar() {
   paginaHorizontal(false);
   $vista.classList.remove('ancho');
   const rutas = { '': vistaInicio, bodega: vistaBodega, inventario: () => vistaInventario(partes[1]), salidas: () => vistaInventario(), secundaria: () => vistaSecundaria(partes[1]), cocina: () => vistaCocina(partes[1]), produccion: vistaProduccion, hojas: vistaHojas,
-    hoja: () => vistaHoja(Number(partes[1])), etiquetas: () => vistaEtiquetas(), consulta: vistaConsulta, admin: () => vistaAdmin(partes[1]) };
+    hoja: () => vistaHoja(Number(partes[1])), etiquetas: () => vistaEtiquetas(), despachos: () => vistaDespachos(partes[1], partes[2]), consulta: vistaConsulta, admin: () => vistaAdmin(partes[1]) };
   const vista = rutas[partes[0]] || vistaInicio;
   if (!area()) { vistaInicio(); return; }
   if (necesitaClave()) { vistaClave(); return; }

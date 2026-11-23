@@ -424,3 +424,55 @@ tr.fuera-pagina { display: none; }
 .estado-claves { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
 .estado-claves > div { flex: 1; min-width: 180px; }
 .estado-claves .boton { margin: 0; }
+
+/* Despachos: destinos, congelador y guía */
+.rejilla-destinos { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+.mosaico.destino { min-height: 70px; }
+.mosaico.destino small { display: block; font-size: .74rem; line-height: 1.35; margin-top: .15rem; }
+.mosaico.destino.elegido { border-color: var(--trigo); background: var(--trigo); color: #fff; }
+.mosaico.destino.elegido small { color: #dfe4ef; }
+.mosaico.destino.nuevo { border-style: dashed; text-align: center; display: grid; place-content: center; }
+.lote-cong { flex-wrap: wrap; }
+.lote-cong .salen { flex: none; text-align: center; }
+.lote-cong .salen label { margin: 0 0 .2rem; font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; color: var(--tinta-suave); }
+.salen-fila { display: flex; gap: .35rem; align-items: center; }
+.campo-paquetes { width: 4.6rem !important; text-align: center; font-size: 1.15rem; font-weight: 700; padding: .45rem !important; }
+.despacho-cab { display: flex; justify-content: space-between; gap: .8rem; align-items: flex-start; }
+.despacho-num { font-family: var(--mono); }
+.chips-despacho { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .5rem; }
+.tarjeta.despacho.anulado { opacity: .65; }
+.fila-destino { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.fila-destino .datos { min-width: 0; }
+.nombre-destino { font-size: 1.1rem; }
+.form-destino .dos-col { display: grid; grid-template-columns: 1fr 1fr; gap: 0 .7rem; }
+.bloque-despachos { margin: -.3rem 0 1rem; padding: .2rem 1rem .4rem; border-left: 4px solid var(--trigo); }
+.bloque-despachos h3 { margin: .5rem 0 .3rem; }
+.destinos-avisar { margin-top: .6rem; }
+@media (max-width: 560px) {
+  .form-destino .dos-col { grid-template-columns: 1fr; }
+  .fila-destino, .despacho-cab { flex-direction: column; align-items: stretch; }
+}
+.chips-despacho .chip-lote { font-family: inherit; font-weight: 500; }
+.chips-despacho .chip-lote b { font-weight: 800; }
+.destino-elegido { display: flex; align-items: center; justify-content: space-between; gap: .8rem; flex-wrap: wrap; margin: .6rem 0 0; padding: .55rem .9rem; background: var(--trigo-claro); border-radius: var(--radio); }
+.tarjeta.zona-peligro { border: 2px solid var(--alerta); }
+.tarjeta.zona-peligro h2 { color: var(--alerta); }
+/* Empaques */
+.equivale { color: var(--ok); font-weight: 700; min-height: 1.1em; margin-top: .2rem; }
+.unidad-fija { display: flex; flex-direction: column; justify-content: center; min-height: 2.9rem; padding: .35rem .8rem; border-radius: var(--radio); background: var(--trigo-claro); }
+.unidad-fija b { font-size: 1rem; }
+.empaque-linea { align-items: center; gap: .5rem; }
+.empaque-linea select, .empaque-linea input { width: auto; min-width: 5rem; }
+.prod-nombre .etq { align-self: flex-start; margin-top: .25rem; }
+/* Fotos de la recepción */
+.fotos-recepcion { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.fotos-recepcion .foto-elegida img { max-height: 160px; }
+.fotos-fila { display: flex; gap: .7rem; margin-top: .25rem; }
+.ver-foto img { display: block; max-width: 100%; max-height: 65vh; margin: 0 auto .6rem; border-radius: var(--radio); }
+.ver-etiqueta { font-family: inherit; font-size: .8rem; margin-left: .6rem; vertical-align: middle; }
+@media (max-width: 560px) { .fotos-recepcion { grid-template-columns: 1fr; } }
+.empaque-linea { display: flex !important; flex-wrap: nowrap !important; justify-content: flex-start !important; align-items: center; gap: .5rem; }
+.empaque-linea > * { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; margin: 0 !important; }
+.empaque-linea select { min-width: 6.5rem; }
+.empaque-linea input { width: 5.5rem !important; }
+.unidad-fija.vacia { background: transparent; border: 1px dashed var(--borde, #cfd5e2); }
