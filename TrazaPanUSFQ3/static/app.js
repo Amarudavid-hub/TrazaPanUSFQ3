@@ -1500,6 +1500,9 @@ async function vistaProduccion() {
     // Un pan que ya está en producción no se puede empezar otra vez hasta que termine.
     h('div', { class: 'rejilla' }, productos.filter((p) => p.activo && !p.armado).map((p) => {
       const enMarcha = enCurso.some((x) => x.producto_id === p.id && !x.masa_lista_en);
+      if (p.se_alimenta) return h('button', { class: 'mosaico' + (p.lineas.length ? '' : ' vacio'), type: 'button',
+        onclick: () => intentar(async () => { if (await alimentar(p)) vistaProduccion(); }) },
+        h('b', null, p.nombre), h('small', null, p.ultima_alimentacion ? 'Alimentada ' + hora(p.ultima_alimentacion) : 'Se alimenta'));
       return h('button', { class: 'mosaico' + (p.lineas.length && !enMarcha ? '' : ' vacio'), disabled: enMarcha,
       type: 'button', onclick: (ev) => intentar(async () => {
         if (ev.currentTarget) ev.currentTarget.disabled = true;
@@ -1516,6 +1519,27 @@ async function vistaProduccion() {
         vistaProduccion();
       }) }, h('b', null, p.nombre), h('small', null, enMarcha ? 'En producción' : p.produce ? 'Subreceta' : (p.lineas.length ? 'Lote …' + p.codigo : 'Sin receta todavía')));
     })));
+}
+
+// Masa madre: no se elabora, se alimenta. Se anotan los lotes de harina abiertos en cocina en este momento; la masa madre
+// guarda las alimentaciones del último mes (las más antiguas dejan de anotarse en los panes).
+async function alimentar(p) {
+  const conLote = p.lineas.filter((l) => l.tipo !== 'no_aplica');
+  const abiertos = await Promise.all(conLote.map((l) => api('/lotes?donde=abiertos&ingrediente_id=' + l.ingrediente_id)));
+  const dias = p.vida_util_dias || 30;
+  return modal('Alimentar ' + p.nombre, h('div', null,
+    h('p', { style: 'margin-top:0' }, 'Se anotan los lotes que están abiertos en cocina ahora:'),
+    conLote.map((l, i) => h('div', { class: 'tarjeta', style: 'margin:.4rem 0;padding:.6rem .8rem' },
+      h('b', null, l.ingrediente), ': ',
+      abiertos[i].length ? abiertos[i].map((x, j) => [j ? ', ' : '', h('b', { class: 'mono' }, x.lote)])
+        : h('span', { style: 'color:var(--alerta)' }, 'ninguno abierto. Ábrelo en Cocina antes de alimentar.'))),
+    h('p', { class: 'chico suave' }, 'La masa madre guarda los lotes de las alimentaciones de los últimos ' + dias + ' días'
+      + (p.alimentaciones_guardadas ? ' (ahora tiene ' + p.alimentaciones_guardadas + ')' : '') + '. Las más antiguas salen solas.')),
+  [{ texto: 'Alimentar', clase: 'principal', accion: async () => {
+      const r = await api('/productos/' + p.id + '/alimentar', {});
+      avisar(p.nombre + ' alimentada · lote ' + r.lote_final + (r.salieron ? ' · salieron ' + r.salieron + ' alimentaciones de hace más de ' + dias + ' días' : ''), 'bien');
+      return true;
+    } }, { texto: 'Cancelar', valor: null }]);
 }
 
 // Antes de empezar una subreceta: ¿lo que quedaba de la anterior se terminó, se guarda aparte o se mezcla con la nueva?
@@ -2459,9 +2483,13 @@ async function vistaAdmin(pestana) {
       const meses = h('input', { type: 'number', min: '0', value: p.vida_util_meses });
       const dias = h('input', { type: 'number', min: '1', value: p.vida_util_dias || 7 });
       const sub = h('input', { type: 'checkbox', checked: !!p.produce_ingrediente_id, onchange: () => { alternarVida(); dibujarLineas(); } });
+      const alim = h('input', { type: 'checkbox', checked: !!p.se_alimenta, onchange: () => { if (alim.checked && Number(dias.value) < 30) dias.value = 30; alternarVida(); } });
       const cajaMeses = h('div', null, h('label', null, 'Vida útil (meses)'), meses);
-      const cajaDias = h('div', null, h('label', null, 'Vida útil (días)'), dias);
-      const alternarVida = () => { cajaMeses.hidden = sub.checked; cajaDias.hidden = !sub.checked; };
+      const etDias = h('label', null, 'Vida útil (días)');
+      const cajaDias = h('div', null, etDias, dias);
+      const opAlim = h('label', { class: 'opcion-grande' }, alim, 'Se alimenta (masa madre)');
+      const alternarVida = () => { cajaMeses.hidden = sub.checked; cajaDias.hidden = !sub.checked; opAlim.hidden = !sub.checked;
+        etDias.textContent = sub.checked && alim.checked ? 'Guarda las alimentaciones de (días)' : 'Vida útil (días)'; };
       const arm = h('input', { type: 'checkbox', checked: !!p.armado, onchange: () => alternar() });
       let componentes = (p.componentes || []).map((c) => c.id);
       const panes = productos.filter((x) => !x.armado && !x.produce && x.id !== p.id && (x.activo || (p.componentes || []).some((c) => c.id === x.id)));
@@ -2504,10 +2532,10 @@ async function vistaAdmin(pestana) {
         h('div', { class: 'opciones-receta' },
           h('label', { class: 'opcion-grande' }, sub, 'Es subreceta'),
           h('label', { class: 'opcion-grande' }, arm, 'Es Mix Bread'),
-          null),
+          opAlim),
         seccionMix, seccionReceta,
         h('div', { class: 'fila-botones' }, h('button', { class: 'boton principal', type: 'button', onclick: () => intentar(async () => {
-          await api('/productos', { id: p.id, nombre: nombre.value, codigo: codigo.value, vida_util_meses: meses.value, vida_util_dias: dias.value, es_subreceta: sub.checked,
+          await api('/productos', { id: p.id, nombre: nombre.value, codigo: codigo.value, vida_util_meses: meses.value, vida_util_dias: dias.value, es_subreceta: sub.checked, se_alimenta: sub.checked && alim.checked,
             inactivo: p.id ? !p.activo : false, lineas, armado: arm.checked, componentes: componentes.filter(Boolean) });
           avisar('Receta guardada', 'bien'); recargar();
         }) }, 'Guardar receta'))));

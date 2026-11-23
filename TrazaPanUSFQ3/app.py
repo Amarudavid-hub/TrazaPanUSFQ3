@@ -443,6 +443,12 @@ def migrar(con):
     # Version 14: subrecetas (relleno, glace, masa madre): vida util en dias, cantidad usada el dia y caducidad del lote.
     if "vida_util_dias" not in {f["name"] for f in con.execute("PRAGMA table_info(productos)")}:
         con.execute("ALTER TABLE productos ADD COLUMN vida_util_dias INTEGER")
+    # Masa madre: no se elabora, se alimenta. Cada alimentacion anota la harina abierta en ese momento y
+    # la masa madre guarda las alimentaciones de los ultimos vida_util_dias dias (30 = un mes).
+    if "se_alimenta" not in {f["name"] for f in con.execute("PRAGMA table_info(productos)")}:
+        con.execute("ALTER TABLE productos ADD COLUMN se_alimenta INTEGER DEFAULT 0")
+        con.execute("UPDATE productos SET se_alimenta=1, vida_util_dias=? WHERE produce_ingrediente_id IS NOT NULL AND nombre LIKE 'MASA MADRE%%'",
+                    (DIAS_MEMORIA_MASA_MADRE,))
     columnas_p = {f["name"] for f in con.execute("PRAGMA table_info(producciones)")}
     if "cantidad_usada" not in columnas_p:
         con.execute("ALTER TABLE producciones ADD COLUMN cantidad_usada TEXT DEFAULT ''")
@@ -2739,7 +2745,10 @@ def anteriores_de(con, puestos):
 
 @app.get("/api/cocina/recipientes")
 def api_recipientes():
-    return jsonify(grupos=recipientes_abiertos(db()), maximo=MAX_LOTES_RECIPIENTE)
+    con = db()
+    if podar_masa_madre(con, "Cocina"):
+        con.commit()
+    return jsonify(grupos=recipientes_abiertos(con), maximo=MAX_LOTES_RECIPIENTE)
 
 
 @app.post("/api/cocina/vaciar")
@@ -3024,6 +3033,11 @@ def api_productos():
         p["componentes"] = filas(con.execute(
             """SELECT c.componente_id AS id, pr.nombre FROM composicion c JOIN productos pr ON pr.id=c.componente_id
                WHERE c.producto_id=? ORDER BY c.orden""", (p["id"],)))
+        if p["se_alimenta"]:
+            p["ultima_alimentacion"] = con.execute("SELECT MAX(iniciado_en) FROM producciones WHERE producto_id=? AND estado<>'anulada'",
+                                                   (p["id"],)).fetchone()[0]
+            p["alimentaciones_guardadas"] = con.execute("SELECT COUNT(*) FROM lotes WHERE ingrediente_id=? AND agotado=0",
+                                                        (p["produce_ingrediente_id"],)).fetchone()[0]
     return jsonify(productos)
 
 
@@ -3141,6 +3155,9 @@ def iniciar_produccion():
         raise ErrorApi("Elige el producto.")
     if not prod["activo"]:
         raise ErrorApi("%s fue eliminado de las recetas: no se puede empezar." % prod["nombre"])
+    if prod["se_alimenta"]:
+        raise ErrorApi("%s no se empieza: se alimenta (botón «Alimentar»)." % prod["nombre"])
+    podar_masa_madre(con, persona)
     # No se empieza si en cocina hay abierto un lote caducado de algun ingrediente de la receta.
     de_receta = {f[0] for f in con.execute("SELECT ingrediente_id FROM receta WHERE producto_id=?", (prod["id"],))}
     caducados = ["%s de %s (caducó el %s)" % (l["lote"], g["ingrediente"], dia_texto(l["caducidad"]))
@@ -3232,6 +3249,87 @@ def iniciar_produccion():
                         (lote_final, pid)).fetchone()[0]
     hoja["mismo_codigo"] = otras
     return jsonify(hoja)
+
+
+DIAS_MEMORIA_MASA_MADRE = 30
+
+
+def podar_masa_madre(con, persona):
+    """Las alimentaciones de hace mas de vida_util_dias dias salen de la masa madre: sus lotes de harina dejan de
+    anotarse en los panes. Devuelve cuantos lotes salieron."""
+    hoy = dt.date.today()
+    n = 0
+    for prod in con.execute("SELECT * FROM productos WHERE se_alimenta=1 AND produce_ingrediente_id IS NOT NULL").fetchall():
+        limite = (hoy - dt.timedelta(days=prod["vida_util_dias"] or DIAS_MEMORIA_MASA_MADRE)).isoformat()
+        for l in con.execute("SELECT id, lote FROM lotes WHERE ingrediente_id=? AND agotado=0 AND substr(creado_en,1,10)<=?",
+                             (prod["produce_ingrediente_id"], limite)).fetchall():
+            con.execute("UPDATE aperturas SET cerrado_en=?, cerrado_por=? WHERE lote_id=? AND cerrado_en IS NULL", (ahora(), persona, l["id"]))
+            con.execute("UPDATE lotes SET agotado=1 WHERE id=?", (l["id"],))
+            anotar(con, persona, "MASA_MADRE_SALE", "%s: la alimentación %s ya tiene más de %d días y sale de la masa madre" % (
+                prod["nombre"], l["lote"], prod["vida_util_dias"] or DIAS_MEMORIA_MASA_MADRE), l["id"])
+            n += 1
+    return n
+
+
+@app.post("/api/productos/<int:producto_id>/alimentar")
+def api_alimentar(producto_id):
+    """Alimentar la masa madre: se anotan los lotes de harina abiertos en cocina en este momento. Cada alimentacion es un
+    lote interno (231126MM, 231126MM-2...) que se junta con las alimentaciones del ultimo mes; las mas antiguas salen."""
+    with CANDADO_INICIO:
+        datos = cuerpo()
+        persona = persona_de(datos)
+        con = db()
+        prod = con.execute("SELECT * FROM productos WHERE id=?", (producto_id,)).fetchone()
+        if not prod or not prod["se_alimenta"] or not prod["produce_ingrediente_id"]:
+            raise ErrorApi("Ese producto no se alimenta.")
+        if not prod["activo"]:
+            raise ErrorApi("%s fue eliminado de las recetas." % prod["nombre"])
+        receta = con.execute(
+            """SELECT r.orden, r.etiqueta, r.ingrediente_id, i.tipo, i.nombre FROM receta r JOIN ingredientes i ON i.id=r.ingrediente_id
+               WHERE r.producto_id=? ORDER BY r.orden""", (prod["id"],)).fetchall()
+        if not receta:
+            raise ErrorApi("«%s» todavía no tiene receta. Agrégala en Administrar → Recetas." % prod["nombre"])
+        abiertos = {r["ingrediente_id"]: listar_lotes(con, "abiertos", r["ingrediente_id"]) for r in receta if r["tipo"] != "no_aplica"}
+        faltan = [r["nombre"] for r in receta if r["tipo"] != "no_aplica" and not abiertos[r["ingrediente_id"]]]
+        if faltan:
+            raise ErrorApi("No hay ningún lote abierto en cocina de: %s. Ábrelo en Cocina y vuelve a alimentar." % ", ".join(faltan))
+        caducados = ["%s de %s (caducó el %s)" % (l["lote"], l["ingrediente"], dia_texto(l["caducidad"]))
+                     for ls in abiertos.values() for l in ls if l["semaforo"] == "rojo"]
+        if caducados:
+            raise ErrorApi("No se puede alimentar: en cocina está abierto un lote caducado: %s. Dalo de baja en Cocina." % "; ".join(caducados))
+        salieron = podar_masa_madre(con, persona)
+        hoy = dt.date.today()
+        ing_id = prod["produce_ingrediente_id"]
+        base = lote_final = hoy.strftime("%d%m%y") + prod["codigo"]
+        n = 1
+        while con.execute("SELECT 1 FROM lotes WHERE ingrediente_id=? AND lote=?", (ing_id, lote_final)).fetchone():
+            n += 1
+            lote_final = "%s-%d" % (base, n)
+        momento = ahora()
+        pid = con.execute(
+            """INSERT INTO producciones(producto_id,producto,fecha,lote_final,estado,iniciado_en,iniciado_por,terminado_en,terminado_por,
+                                        completado_en,completado_por,observaciones) VALUES(?,?,?,?,'completa',?,?,?,?,?,?,?)""",
+            (prod["id"], prod["nombre"], hoy.isoformat(), lote_final, momento, persona, momento, persona, momento, persona, "Alimentación")).lastrowid
+        for r in receta:
+            lin = con.execute("INSERT INTO produccion_lineas(produccion_id,orden,etiqueta,ingrediente_id,tipo) VALUES(?,?,?,?,?)",
+                              (pid, r["orden"], r["etiqueta"], r["ingrediente_id"], r["tipo"]))
+            for lote in abiertos.get(r["ingrediente_id"], []):
+                con.execute("INSERT INTO produccion_lotes(linea_id,lote_id,origen,agregado_en,agregado_por) VALUES(?,?,?,?,?)",
+                            (lin.lastrowid, lote["id"], "inicio", momento, persona))
+        dias = prod["vida_util_dias"] or DIAS_MEMORIA_MASA_MADRE
+        con.execute("INSERT INTO lotes(ingrediente_id,lote,origen,creado_en,creado_por,caducidad) VALUES(?,?,?,?,?,?)",
+                    (ing_id, lote_final, "interno", momento, persona, (hoy + dt.timedelta(days=dias)).isoformat()))
+        # La masa madre es una sola: la alimentacion nueva y las del ultimo mes quedan juntas en cocina.
+        # No se agrega a los panes que ya empezaron: su masa madre se tomo antes de alimentarla.
+        juntos = 0
+        for l in con.execute("SELECT id FROM lotes WHERE ingrediente_id=? AND agotado=0 ORDER BY id", (ing_id,)).fetchall():
+            if not con.execute("SELECT 1 FROM aperturas WHERE lote_id=? AND cerrado_en IS NULL", (l["id"],)).fetchone():
+                con.execute("INSERT INTO aperturas(lote_id,abierto_en,abierto_por,recipiente) VALUES(?,?,?,1)", (l["id"], momento, persona))
+            juntos += 1
+        harinas = ", ".join("%s %s" % (l["ingrediente"], l["lote"]) for ls in abiertos.values() for l in ls)
+        anotar(con, persona, "ALIMENTACION", "%s alimentada (lote %s) con %s" % (prod["nombre"], lote_final, harinas), produccion_id=pid)
+        con.commit()
+        return jsonify(ok=True, lote_final=lote_final, produccion_id=pid, harinas=harinas, alimentaciones=juntos, salieron=salieron)
 
 
 @app.post("/api/producciones/<int:pid>/terminar")
@@ -4390,6 +4488,7 @@ def api_producto_guardar():
         raise ErrorApi("La vida útil debe ser un número entero.")
     produce = None
     armado = 1 if datos.get("armado") else 0
+    alimenta = 1 if datos.get("se_alimenta") and datos.get("es_subreceta") and not armado else 0
     if datos.get("es_subreceta") and not armado:
         con.execute("INSERT OR IGNORE INTO ingredientes(nombre,tipo) VALUES(?,?)", (normalizar(nombre), "interno"))
         fila = con.execute("SELECT id, tipo FROM ingredientes WHERE nombre=?", (normalizar(nombre),)).fetchone()
@@ -4398,12 +4497,12 @@ def api_producto_guardar():
         produce = fila["id"]
     try:
         if datos.get("id"):
-            con.execute("UPDATE productos SET nombre=?, codigo=?, vida_util_meses=?, vida_util_dias=?, produce_ingrediente_id=?, activo=?, armado=? WHERE id=?",
-                        (nombre, codigo, meses, dias, produce, 0 if datos.get("inactivo") else 1, armado, datos["id"]))
+            con.execute("UPDATE productos SET nombre=?, codigo=?, vida_util_meses=?, vida_util_dias=?, produce_ingrediente_id=?, activo=?, armado=?, se_alimenta=? WHERE id=?",
+                        (nombre, codigo, meses, dias, produce, 0 if datos.get("inactivo") else 1, armado, alimenta, datos["id"]))
             pid = datos["id"]
         else:
-            pid = con.execute("INSERT INTO productos(nombre,codigo,vida_util_meses,vida_util_dias,produce_ingrediente_id,armado) VALUES(?,?,?,?,?,?)",
-                              (nombre, codigo, meses, dias, produce, armado)).lastrowid
+            pid = con.execute("INSERT INTO productos(nombre,codigo,vida_util_meses,vida_util_dias,produce_ingrediente_id,armado,se_alimenta) VALUES(?,?,?,?,?,?,?)",
+                              (nombre, codigo, meses, dias, produce, armado, alimenta)).lastrowid
     except sqlite3.IntegrityError:
         raise ErrorApi("Ya existe un producto con ese nombre.")
     con.execute("DELETE FROM receta WHERE producto_id=?", (pid,))
