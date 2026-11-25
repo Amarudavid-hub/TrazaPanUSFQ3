@@ -2265,6 +2265,8 @@ const escaparHtml = (t) => String(t == null ? '' : t).replace(/[&<>"']/g, (c) =>
 // La etiqueta se dibuja como imagen en blanco y negro puro, punto por punto, a la resolución de la Zebra (203 dpi = 8 puntos/mm).
 // Así el driver no tiene grises que "tramar" y las letras salen completas y negras (con texto normal salían cortadas).
 const PUNTOS_MM = 8;
+// Ajuste fino de la posición (mm; negativo = más arriba), guardado en esta computadora. Sirve si la impresora la corre.
+const ajusteEtiqueta = () => { try { return Number(localStorage.getItem('etiqueta_ajuste_mm')) || 0; } catch (e) { return 0; } };
 function imagenEtiqueta(d) {
   const W = Math.round(ETIQUETA_MM.ancho * PUNTOS_MM), H = Math.round(ETIQUETA_MM.alto * PUNTOS_MM);
   const lienzo = document.createElement('canvas');
@@ -2273,7 +2275,7 @@ function imagenEtiqueta(d) {
   c.fillStyle = '#fff'; c.fillRect(0, 0, W, H);
   c.fillStyle = '#000'; c.strokeStyle = '#000'; c.textBaseline = 'alphabetic'; c.lineJoin = 'round';
   const izq = Math.round(3.5 * PUNTOS_MM), maxAncho = W - izq - 2 * PUNTOS_MM;
-  const lineas = [['LOTE: ' + d.lote_final, 6.2], ['FE: ' + fechaEtiqueta(d.fe), 4.3], ['FV: ' + fechaEtiqueta(d.fv), 4.3]];
+  const lineas = [['LOTE: ' + d.lote_final, 5.9], ['FE: ' + fechaEtiqueta(d.fe), 4.1], ['FV: ' + fechaEtiqueta(d.fv), 4.1]];
   const tam = lineas.map(([t, mm]) => {
     let px = Math.round(mm * PUNTOS_MM);
     c.font = 'bold ' + px + 'px Arial, Helvetica, sans-serif';
@@ -2281,8 +2283,9 @@ function imagenEtiqueta(d) {
     return px;
   });
   const alturas = tam.map((px) => Math.round(px * 0.74));                   // alto de las mayúsculas
-  const sep = Math.round(1.6 * PUNTOS_MM);
-  let y = Math.round((H - (alturas.reduce((a, b) => a + b, 0) + sep * 2)) / 2);
+  const sep = Math.round(1.4 * PUNTOS_MM);
+  // Arriba, con 1,5 mm de margen (centrado quedaba muy abajo en la Zebra y la última línea se cortaba), más el ajuste fino.
+  let y = Math.max(0, Math.round((1.5 + ajusteEtiqueta()) * PUNTOS_MM));
   lineas.forEach(([t], k) => {
     y += alturas[k];
     c.font = 'bold ' + tam[k] + 'px Arial, Helvetica, sans-serif';
@@ -2312,6 +2315,67 @@ function htmlEtiquetas(lotes) {
     + '.et img{display:block;width:' + ancho + 'mm;height:' + alto + 'mm;image-rendering:pixelated;image-rendering:crisp-edges}'
     + '</style></head><body>' + cuerpo + '</body></html>';
 }
+// ---- Impresión directa con Zebra Browser Print (programa gratuito de Zebra instalado en la computadora de la impresora).
+// La app le manda a la Zebra la etiqueta en su propio idioma (ZPL o EPL): sin ventana de impresión ni driver de Windows.
+const ZEBRA_URLS = location.protocol === 'https:' ? ['https://127.0.0.1:9101/', 'http://127.0.0.1:9100/'] : ['http://127.0.0.1:9100/', 'https://127.0.0.1:9101/'];
+const ZEBRA_INSTALAR = 'https://www.zebra.com/us/en/support-downloads/printer-software/browser-print.html';
+async function zebraLlamar(ruta, cuerpo) {
+  let ultimo = null;
+  for (const base of ZEBRA_URLS) {
+    try {
+      const r = await fetch(base + ruta, cuerpo === undefined ? { cache: 'no-store' }
+        : { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify(cuerpo) });
+      if (!r.ok) throw new Error('La Zebra respondió con error ' + r.status + (await r.text().catch(() => '') ? ': ' + await r.text().catch(() => '') : ''));
+      return await r.text();
+    } catch (e) { ultimo = e; }
+  }
+  throw ultimo || new Error('Sin respuesta');
+}
+async function zebraImpresora() {
+  let txt;
+  try { txt = await zebraLlamar('default?type=printer'); } catch (e) {
+    throw new Error('No se encontró «Zebra Browser Print» en esta computadora. Instálalo y ábrelo (icono de Zebra junto al reloj), y vuelve a intentar.');
+  }
+  let dev = null;
+  try { dev = txt ? JSON.parse(txt) : null; } catch (e) { dev = null; }
+  if (!dev || !dev.uid) {
+    try { const a = JSON.parse(await zebraLlamar('available')); dev = (a.printer || [])[0] || null; } catch (e) { dev = null; }
+  }
+  if (!dev) throw new Error('Zebra Browser Print está abierto, pero no encuentra la impresora. Revisa que la Zebra esté encendida y conectada por USB.');
+  return dev;
+}
+const idiomaZebra = () => { try { return localStorage.getItem('zebra_idioma') || 'ZPL'; } catch (e) { return 'ZPL'; } };
+// Etiqueta de 50 × 20,5 mm a 203 dpi (400 × 164 puntos): LOTE grande, FE y FV debajo, igual a la plantilla de ZebraDesigner.
+function comandosEtiquetas(lotes, idioma) {
+  const izq = 28, util = 400 - izq - 16, dy = Math.round(ajusteEtiqueta() * PUNTOS_MM);
+  if (idioma === 'EPL') {
+    const q = (t) => String(t).replace(/[\\"]/g, ' ');
+    return lotes.filter((d) => d.cantidad > 0).map((d) => {
+      const lote = 'LOTE: ' + d.lote_final;
+      const hm = lote.length * 16 * 2 <= util ? 2 : 1;                      // fuente 4 (14 x 24 puntos), más ancha si entra
+      return ['', 'N',
+        'A' + izq + ',' + Math.max(0, 8 + dy) + ',0,4,' + hm + ',2,N,"' + q(lote) + '"',
+        'A' + izq + ',' + Math.max(0, 64 + dy) + ',0,3,1,2,N,"' + q('FE: ' + fechaEtiqueta(d.fe)) + '"',
+        'A' + izq + ',' + Math.max(0, 108 + dy) + ',0,3,1,2,N,"' + q('FV: ' + fechaEtiqueta(d.fv)) + '"',
+        'P' + d.cantidad, ''].join('\r\n');
+    }).join('');
+  }
+  const z = (t) => String(t).replace(/[\^~]/g, ' ');
+  const ancho = (texto, alto) => Math.min(alto, Math.floor(util / (texto.length * 0.56)));   // ^A0 es condensada: ~0,56 del alto por letra
+  return lotes.filter((d) => d.cantidad > 0).map((d) => {
+    const lote = 'LOTE: ' + d.lote_final, fe = 'FE: ' + fechaEtiqueta(d.fe), fv = 'FV: ' + fechaEtiqueta(d.fv);
+    const wl = ancho(lote, 50), wf = Math.min(ancho(fe, 36), ancho(fv, 36));
+    return '^XA^MTT^CI28^LH0,0'                          // ^MTT: transferencia térmica (con cinta)
+      + '^FO' + izq + ',' + (8 + dy) + '^A0N,' + Math.min(48, wl + 6) + ',' + wl + '^FD' + z(lote) + '^FS'
+      + '^FO' + izq + ',' + (64 + dy) + '^A0N,34,' + wf + '^FD' + z(fe) + '^FS'
+      + '^FO' + izq + ',' + (106 + dy) + '^A0N,34,' + wf + '^FD' + z(fv) + '^FS'
+      + '^PQ' + d.cantidad + '^XZ';
+  }).join('\n');
+}
+async function imprimirEnZebra(lotes, dev) {
+  await zebraLlamar('write', { device: dev || await zebraImpresora(), data: comandosEtiquetas(lotes, idiomaZebra()) });
+}
+
 function imprimirEtiquetas(lotes) {
   const marco = h('iframe', { style: 'position:fixed;right:0;bottom:0;width:0;height:0;border:0', 'aria-hidden': 'true' });
   document.body.append(marco);
@@ -2405,7 +2469,7 @@ async function vistaEtiquetas() {
     return { d, c, tr, pintar: pintarFila };
   });
 
-  const botonImprimir = h('button', { class: 'boton principal', type: 'button', onclick: () => intentar(async () => {
+  const imprimir = (directo) => intentar(async () => {
     const marcadas = lista.filter((d) => elegidas.has(d.id)).map((d) => ({ ...d, cantidad: Number(mapaActual().get(d.id)) }));
     const mal = marcadas.filter((d) => !(Number.isInteger(d.cantidad) && d.cantidad > 0));
     if (mal.length) throw new Error((re() ? 'Escribe cuántas etiquetas reimprimir del lote ' : 'Escribe cuántos paquetes tiene el lote ')
@@ -2416,13 +2480,27 @@ async function vistaEtiquetas() {
           h('b', null, d.cantidad + ' paquete' + (d.cantidad === 1 ? '' : 's'))))),
         h('p', { class: 'chico suave' }, 'Después no se vuelven a imprimir como nuevos; si un número quedó mal se puede corregir con un motivo.')),
       [{ texto: 'Sí, están bien: imprimir', clase: 'principal', valor: true }, { texto: 'Revisar', valor: null }])) return;
+    const dev = directo ? await zebraImpresora() : null;          // antes de registrar: que la Zebra esté lista
     await api('/etiquetas/impresion', { reimpresion: re(), cuaderno: cuaderno.checked, items: marcadas.map((d) => ({ id: d.id, cantidad: d.cantidad })) });
-    imprimirEtiquetas(marcadas.map((d) => ({ ...d, cantidad: d.cantidad + extra() })));
+    const aImprimir = marcadas.map((d) => ({ ...d, cantidad: d.cantidad + extra() }));
+    if (directo) {
+      try { await imprimirEnZebra(aImprimir, dev); avisar('Enviado a la Zebra', 'bien'); } catch (e) {
+        throw new Error('Los paquetes quedaron registrados, pero la Zebra no imprimió (' + e.message + '). Vuelve a intentar con «Reimpresión».');
+      }
+    } else imprimirEtiquetas(aImprimir);
     if (!re()) {
       marcadas.forEach((d) => { const o = lista.find((x) => x.id === d.id); o.n_etiquetas = d.cantidad; o.paquetes_confirmados_en = new Date().toISOString(); });
       elegirPorDefecto(); filas.forEach((x) => x.pintar()); contar();
     }
-  }) });
+  });
+  const botonImprimir = h('button', { class: 'boton principal', type: 'button', onclick: () => imprimir(true) });
+  const botonVentana = h('button', { class: 'boton', type: 'button', onclick: () => imprimir(false) }, 'Imprimir con ventana');
+  const idioma = segmento([['ZPL', 'ZPL'], ['EPL', 'EPL']], idiomaZebra(), (v) => { try { localStorage.setItem('zebra_idioma', v); } catch (e) { /* sin memoria */ } });
+  const probar = h('button', { class: 'boton chico', type: 'button', onclick: () => intentar(async () => {
+    const dev = await zebraImpresora();
+    await imprimirEnZebra([{ lote_final: 'PRUEBA', fe: estado.hoy.split('-').reverse().join('-'), fv: estado.hoy.split('-').reverse().join('-'), cantidad: 1 }], dev);
+    avisar('Prueba enviada a «' + (dev.name || 'Zebra') + '» en ' + idiomaZebra(), 'bien');
+  }) }, 'Imprimir etiqueta de prueba');
   const botonCsv = h('button', { class: 'boton', type: 'button', onclick: () => bajar('csv') }, 'Descargar CSV');
   const todas = h('input', { type: 'checkbox', title: 'Marcar todas', onchange: (e) => {
     lista.forEach((d) => (e.target.checked && puede(d) ? elegidas.add(d.id) : elegidas.delete(d.id)));
@@ -2432,7 +2510,7 @@ async function vistaEtiquetas() {
     const paq = marcadas.reduce((t, d) => t + (Number(mapaActual().get(d.id)) || 0), 0);
     const cuad = extra() * marcadas.length;
     const n = paq + cuad;
-    botonImprimir.textContent = marcadas.length ? (re() ? 'Reimprimir ' : 'Imprimir ') + n + ' etiqueta' + (n === 1 ? '' : 's') + ' (' + marcadas.length + ' lote' + (marcadas.length > 1 ? 's' : '') + ')'
+    botonImprimir.textContent = marcadas.length ? '🖨 ' + (re() ? 'Reimprimir ' : 'Imprimir ') + n + ' etiqueta' + (n === 1 ? '' : 's') + ' (' + marcadas.length + ' lote' + (marcadas.length > 1 ? 's' : '') + ')'
       : re() ? 'Escribe cuántas reimprimir' : 'Marca los lotes a imprimir';
     cabCant.textContent = re() ? 'Etiquetas' : 'Paquetes';
     const pieza = (numero, texto, clase) => h('span', { class: 'pieza' + (clase ? ' ' + clase : '') }, h('b', null, String(numero)), texto);
@@ -2444,7 +2522,7 @@ async function vistaEtiquetas() {
       : 'Quedan ' + paq + ' paquete' + (paq === 1 ? '' : 's') + ' para despachar.'));
     resumen.className = 'resumen-impresion' + (re() ? ' re' : '');
     resumen.replaceChildren(...piezas);
-    botonImprimir.disabled = botonCsv.disabled = !marcadas.length;
+    botonImprimir.disabled = botonVentana.disabled = botonCsv.disabled = !marcadas.length;
     const posibles = lista.filter(puede).length;
     todas.disabled = !posibles;
     todas.checked = posibles > 0 && marcadas.length === posibles;
@@ -2463,14 +2541,27 @@ async function vistaEtiquetas() {
       : h('p', { class: 'suave', style: 'margin-top:1rem' }, 'No hay producciones en ese periodo.'),
     lista.length ? h('div', { class: 'interruptores' }, interruptor(cuaderno, '📒', '+1 para el cuaderno'), interruptor(reimpresion, '↻', 'Reimpresión')) : null,
     lista.length ? resumen : null,
-    lista.length ? h('div', { class: 'fila-botones' }, botonImprimir, botonCsv) : null,
+    lista.length ? h('div', { class: 'fila-botones' }, botonImprimir, botonVentana, botonCsv) : null,
     h('div', { class: 'tarjeta chico', style: 'margin-top:1.4rem;display:flex;justify-content:space-between;align-items:center;gap:.8rem;flex-wrap:wrap' },
       h('div', null, h('b', null, 'Todos los lotes desde que se usa la app'), h('div', { class: 'suave' }, 'Excel con cada lote, su producto, fechas, etiquetas y estado.')),
       h('button', { class: 'boton', type: 'button', onclick: () => { location.href = '/api/etiquetas.xlsx?todo=1'; } }, 'Descargar historial')),
-    h('div', { class: 'tarjeta chico' }, h('b', null, 'Cómo imprimir'),
-      h('p', null, 'Desde la computadora que tiene la Zebra: marca los lotes, aprieta «Imprimir» y en la ventana de impresión elige ',
-        h('b', null, 'ZDesigner ZD888-203dpi'), ' y en «Más opciones»: tamaño del papel el de la Zebra (', h('b', null, '5,00 × 2,05 cm'), '), diseño ',
-        h('b', null, 'Vertical'), ', márgenes ', h('b', null, 'Ninguno'), ' y escala ', h('b', null, 'Predeterminada'), '. No hay que cambiar nada en el driver.'),
+    h('div', { class: 'tarjeta chico' }, h('b', null, 'Imprimir directo en la Zebra'),
+      h('p', null, 'Desde la computadora que tiene la Zebra conectada, con el programa gratuito ', h('b', null, 'Zebra Browser Print'),
+        ' instalado y abierto (icono de Zebra junto al reloj). «🖨 Imprimir» manda las etiquetas directo, sin ventana de impresión. ',
+        h('a', { href: ZEBRA_INSTALAR, target: '_blank', rel: 'noopener' }, 'Descargar Zebra Browser Print')),
+      h('div', { class: 'en-linea', style: 'align-items:end' },
+        h('div', { style: 'max-width:220px' }, h('label', null, 'Idioma de la impresora'), idioma.el), h('div', null, probar)),
+      h('p', { class: 'chico suave' }, 'Primero imprime la etiqueta de prueba con ZPL; si no sale nada, cambia a EPL y prueba otra vez.'),
+      (() => {
+        const txt = h('b', null);
+        const pintarAj = () => { const a = ajusteEtiqueta(); txt.textContent = a === 0 ? 'normal' : (a < 0 ? Math.abs(a) + ' mm más arriba' : a + ' mm más abajo'); };
+        const mover = (d) => () => { const a = Math.max(-1.5, Math.min(6, Math.round((ajusteEtiqueta() + d) * 2) / 2)); try { localStorage.setItem('etiqueta_ajuste_mm', String(a)); } catch (e) { /* sin memoria */ } pintarAj(); };
+        pintarAj();
+        return h('div', { class: 'en-linea', style: 'align-items:center;margin-top:.4rem' },
+          h('span', null, 'Posición del texto en la etiqueta: ', txt),
+          h('button', { class: 'boton chico', type: 'button', onclick: mover(-0.5) }, '↑ Subir'),
+          h('button', { class: 'boton chico', type: 'button', onclick: mover(0.5) }, '↓ Bajar'));
+      })(),
       h('p', null, 'La primera impresión de cada lote confirma sus paquetes: es lo único que se podrá despachar. Para otra copia usa «Reimpresión»; si un número quedó mal, «Corregir».')));
   contar();
 }
