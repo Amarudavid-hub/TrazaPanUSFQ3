@@ -2262,30 +2262,62 @@ const filtroEtiquetas = {};          // recuerda el periodo elegido mientras la 
 const ETIQUETA_MM = { ancho: 50, alto: 19.5 };
 const fechaEtiqueta = (t) => String(t || '').split('-').join(' - ');        // 05-06-2026 -> 05 - 06 - 2026
 const escaparHtml = (t) => String(t == null ? '' : t).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// La etiqueta se dibuja como imagen en blanco y negro puro, punto por punto, a la resolución de la Zebra (203 dpi = 8 puntos/mm).
+// Así el driver no tiene grises que "tramar" y las letras salen completas y negras (con texto normal salían cortadas).
+const PUNTOS_MM = 8;
+function imagenEtiqueta(d) {
+  const W = Math.round(ETIQUETA_MM.ancho * PUNTOS_MM), H = Math.round(ETIQUETA_MM.alto * PUNTOS_MM);
+  const lienzo = document.createElement('canvas');
+  lienzo.width = W; lienzo.height = H;
+  const c = lienzo.getContext('2d');
+  c.fillStyle = '#fff'; c.fillRect(0, 0, W, H);
+  c.fillStyle = '#000'; c.strokeStyle = '#000'; c.textBaseline = 'alphabetic'; c.lineJoin = 'round';
+  const izq = Math.round(3.5 * PUNTOS_MM), maxAncho = W - izq - 2 * PUNTOS_MM;
+  const lineas = [['LOTE: ' + d.lote_final, 6.2], ['FE: ' + fechaEtiqueta(d.fe), 4.3], ['FV: ' + fechaEtiqueta(d.fv), 4.3]];
+  const tam = lineas.map(([t, mm]) => {
+    let px = Math.round(mm * PUNTOS_MM);
+    c.font = 'bold ' + px + 'px Arial, Helvetica, sans-serif';
+    while (c.measureText(t).width > maxAncho && px > 12) { px -= 1; c.font = 'bold ' + px + 'px Arial, Helvetica, sans-serif'; }
+    return px;
+  });
+  const alturas = tam.map((px) => Math.round(px * 0.74));                   // alto de las mayúsculas
+  const sep = Math.round(1.6 * PUNTOS_MM);
+  let y = Math.round((H - (alturas.reduce((a, b) => a + b, 0) + sep * 2)) / 2);
+  lineas.forEach(([t], k) => {
+    y += alturas[k];
+    c.font = 'bold ' + tam[k] + 'px Arial, Helvetica, sans-serif';
+    c.lineWidth = Math.max(1, tam[k] / 22);                                  // trazo extra: letra más gruesa
+    c.fillText(t, izq, y); c.strokeText(t, izq, y);
+    y += sep;
+  });
+  // Blanco o negro, sin grises.
+  const img = c.getImageData(0, 0, W, H), px = img.data;
+  for (let i = 0; i < px.length; i += 4) {
+    const v = (px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) / 1000 < 170 ? 0 : 255;
+    px[i] = px[i + 1] = px[i + 2] = v; px[i + 3] = 255;
+  }
+  c.putImageData(img, 0, 0);
+  return lienzo.toDataURL('image/png');
+}
 function htmlEtiquetas(lotes) {
-  const una = (d) => '<div class="et"><div class="l">LOTE: ' + escaparHtml(d.lote_final) + '</div><div class="f">FE: ' + escaparHtml(fechaEtiqueta(d.fe))
-    + '</div><div class="f">FV: ' + escaparHtml(fechaEtiqueta(d.fv)) + '</div></div>';
-  const cuerpo = lotes.flatMap((d) => Array.from({ length: Math.max(0, Number(d.cantidad) || 0) }, () => una(d))).join('');
   const { ancho, alto } = ETIQUETA_MM;
+  const cuerpo = lotes.flatMap((d) => {
+    const src = imagenEtiqueta(d);
+    return Array.from({ length: Math.max(0, Number(d.cantidad) || 0) }, () => '<div class="et"><img src="' + src + '" alt="LOTE ' + escaparHtml(d.lote_final) + '"></div>');
+  }).join('');
   return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Etiquetas</title><style>'
     + '@page{size:auto;margin:0}html,body{margin:0;padding:0;background:#fff}'
-    + '.et{width:' + ancho + 'mm;height:' + alto + 'mm;box-sizing:border-box;padding:1mm 2mm 1mm 3.5mm;display:flex;flex-direction:column;justify-content:center;gap:.6mm;'
-    + 'font-family:Arial,Helvetica,sans-serif;font-weight:700;color:#000;overflow:hidden;break-after:page;page-break-after:always;'
-    // Trazo un poco más grueso: en la impresora térmica el texto sale negro y nítido aunque la oscuridad esté baja.
-    + '-webkit-text-stroke:.12mm #000;-webkit-print-color-adjust:exact;print-color-adjust:exact}'
+    + '.et{width:' + ancho + 'mm;height:' + alto + 'mm;overflow:hidden;break-after:page;page-break-after:always}'
     + '.et:last-child{break-after:auto;page-break-after:auto}'
-    + '.l{font-size:6.2mm;line-height:1.05;white-space:nowrap}.f{font-size:4.3mm;line-height:1.1;white-space:nowrap}'
-    + '</style></head><body>' + cuerpo
-    // Si un lote es muy largo, se achica la letra hasta que entre en el ancho de la etiqueta.
-    + '<script>document.querySelectorAll(".l,.f").forEach(function(e){var t=parseFloat(getComputedStyle(e).fontSize);'
-    + 'while(e.scrollWidth>e.clientWidth&&t>6){t-=0.5;e.style.fontSize=t+"px";}});<\/script></body></html>';
+    + '.et img{display:block;width:' + ancho + 'mm;height:' + alto + 'mm;image-rendering:pixelated;image-rendering:crisp-edges}'
+    + '</style></head><body>' + cuerpo + '</body></html>';
 }
 function imprimirEtiquetas(lotes) {
   const marco = h('iframe', { style: 'position:fixed;right:0;bottom:0;width:0;height:0;border:0', 'aria-hidden': 'true' });
   document.body.append(marco);
   const doc = marco.contentDocument;
   doc.open(); doc.write(htmlEtiquetas(lotes)); doc.close();
-  setTimeout(() => {
+  setTimeout(() => {                                     // las imágenes ya están dentro de la página (data:), cargan al instante
     marco.contentWindow.focus();
     marco.contentWindow.print();
     setTimeout(() => marco.remove(), 60000);
