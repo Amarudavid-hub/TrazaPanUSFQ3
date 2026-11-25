@@ -53,7 +53,7 @@ RESPALDOS = os.path.join(DATOS, "respaldos")
 PUERTO = 8000
 
 app = Flask(__name__, static_folder=os.path.join(BASE, "static"), static_url_path="/static")
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 400 * 1024 * 1024     # alcanza para cargar un respaldo completo con fotos
 # Sesiones (contraseñas por área): la sesión dura 30 días en cada dispositivo.
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
                   PERMANENT_SESSION_LIFETIME=dt.timedelta(days=30))
@@ -427,6 +427,9 @@ def migrar(con):
         id INTEGER PRIMARY KEY, lote_id INTEGER NOT NULL REFERENCES lotes(id), cantidad REAL NOT NULL,
         unidad TEXT DEFAULT '', fecha_hora TEXT NOT NULL, persona TEXT, anulado INTEGER DEFAULT 0)""")
     con.execute("CREATE TABLE IF NOT EXISTS meta(clave TEXT PRIMARY KEY, valor TEXT)")
+    # inicial=1: lo que ya estaba en bodega secundaria al hacer su inventario (no sale de bodega principal).
+    if "inicial" not in {f["name"] for f in con.execute("PRAGMA table_info(traslados)")}:
+        con.execute("ALTER TABLE traslados ADD COLUMN inicial INTEGER DEFAULT 0")
     # Version 10: lista fija de unidades de medida de bodega principal.
     con.execute("CREATE TABLE IF NOT EXISTS unidades(id INTEGER PRIMARY KEY, nombre TEXT UNIQUE NOT NULL)")
     # Version 18: foto de cada producto de bodega (la subida desde Administrar reemplaza a la incluida en la app).
@@ -495,6 +498,17 @@ def migrar(con):
         con.execute("ALTER TABLE producciones ADD COLUMN unidades_lote TEXT DEFAULT ''")
     if "vence" not in columnas:          # fecha de vencimiento fija (el Mix Bread toma la mas temprana de sus panes)
         con.execute("ALTER TABLE producciones ADD COLUMN vence TEXT DEFAULT ''")
+    # Panes: peso de cada unidad y unidades que van al consumo de la universidad (lo demas: congelado = lote, Mix Bread).
+    if "gramos_unidad" not in columnas:
+        con.execute("ALTER TABLE producciones ADD COLUMN gramos_unidad TEXT DEFAULT ''")
+    if "unidades_universidad" not in columnas:
+        con.execute("ALTER TABLE producciones ADD COLUMN unidades_universidad TEXT DEFAULT ''")
+    # Despachos: nombre de quien despacha (escrito a mano en el despacho).
+    if "despachado_por" not in {f["name"] for f in con.execute("PRAGMA table_info(despachos)")}:
+        con.execute("ALTER TABLE despachos ADD COLUMN despachado_por TEXT DEFAULT ''")
+    # Paquetes confirmados: se fijan una sola vez al imprimir las etiquetas (despues solo se corrigen con motivo).
+    if "paquetes_confirmados_en" not in columnas:
+        con.execute("ALTER TABLE producciones ADD COLUMN paquetes_confirmados_en TEXT")
     con.execute("""CREATE TABLE IF NOT EXISTS composicion(
         id INTEGER PRIMARY KEY, producto_id INTEGER NOT NULL REFERENCES productos(id), orden INTEGER,
         componente_id INTEGER NOT NULL REFERENCES productos(id))""")
@@ -1318,7 +1332,7 @@ EMPAQUES_INICIALES = {      # lo que indico la panaderia (nov 2026)
     "MANTECA VEGETAL MANTEPAN": ("PAQUETE", 15, "kg"), "MANTEQUILLA S/SAL": ("PAQUETE", 2.2, "kg"),
     "QUESO PARMESANO NACIONAL RALLADO KG": ("PAQUETE", 250, "g"), "VINO BLANCO COCINA CARTON (1LT)": ("PAQUETE", 1.1, "lt"),
     "HARINA INTEGRAL QUINTAL (50KG)": ("PAQUETE", 50, "kg"), "CANELA POLVO": ("PAQUETE", 1, "kg"),
-    "FUNDA VACIO GRANDE": ("PAQUETE", 50, "unidades"), "FUNDA VACIO MEDIANA": ("PAQUETE", 50, "unidades"),
+    "FUNDA VACIO GRANDE": ("PAQUETE", 250, "unidades"), "FUNDA VACIO MEDIANA": ("PAQUETE", 100, "unidades"),
 }
 _UNIDADES_ESCRITAS = {"KG": ("masa", 1000), "KGS": ("masa", 1000), "G": ("masa", 1), "GR": ("masa", 1), "GRS": ("masa", 1),
                       "LT": ("volumen", 1000), "L": ("volumen", 1000), "LTS": ("volumen", 1000), "ML": ("volumen", 1),
@@ -1344,6 +1358,14 @@ def a_paquetes(cantidad, unidad, empaque, contenido, unidad_contenido):
 
 def aplicar_empaques(con):
     """Pone el empaque indicado por la panaderia a los productos que nunca lo tuvieron y convierte lo registrado."""
+    # 24/11/2026: la funda al vacío grande trae 250 unidades por paquete (no 50). Una sola vez, si seguía con el valor anterior.
+    if not con.execute("SELECT 1 FROM meta WHERE clave='v32_funda_grande_250'").fetchone():
+        con.execute("UPDATE alias SET contenido=250 WHERE producto='FUNDA VACIO GRANDE' AND contenido=50 AND unidad_contenido='unidades'")
+        con.execute("INSERT INTO meta(clave, valor) VALUES('v32_funda_grande_250', ?)", (ahora(),))
+    # La funda al vacío mediana (la pequeña) trae 100 unidades por paquete.
+    if not con.execute("SELECT 1 FROM meta WHERE clave='v33_funda_mediana_100'").fetchone():
+        con.execute("UPDATE alias SET contenido=100 WHERE producto='FUNDA VACIO MEDIANA' AND contenido=50 AND unidad_contenido='unidades'")
+        con.execute("INSERT INTO meta(clave, valor) VALUES('v33_funda_mediana_100', ?)", (ahora(),))
     for a in con.execute("SELECT id, producto FROM alias WHERE empaque IS NULL").fetchall():
         e = EMPAQUES_INICIALES.get(a["producto"])
         if e:
@@ -1391,8 +1413,25 @@ def entero_paquetes(texto, empaque, que):
     return int(n)
 
 
+UNIDADES_SUELTAS = ("huevos", "unidades")     # productos que cocina puede tomar de a uno (10 huevos de una cubeta)
+
+
+def por_unidad(lote):
+    return bool(lote.get("empaque") and lote.get("unidad_contenido") in UNIDADES_SUELTAS and (lote.get("contenido") or 0) > 1)
+
+
 def cantidad_texto(n, lote):
-    """'5 cubetas (150 huevos)' o '5 KG' si el producto no tiene empaque."""
+    """'5 cubetas (150 huevos)', '2 cubetas y 20 huevos' o '5 KG' si el producto no tiene empaque."""
+    if por_unidad(lote) and abs(n - round(n)) > 1e-6:
+        c = int(round(lote["contenido"]))
+        sueltas = int(round(n * lote["contenido"]))
+        enteros, resto = divmod(sueltas, c)
+        partes = []
+        if enteros:
+            partes.append("%d %s" % (enteros, plural_empaque(lote["empaque"]) if enteros != 1 else lote["empaque"].lower()))
+        if resto or not enteros:
+            partes.append("%d %s" % (resto, lote["unidad_contenido"]))
+        return " y ".join(partes)
     if lote.get("empaque") and lote.get("contenido"):
         total, u = n * lote["contenido"], lote["unidad_contenido"]
         if u in ("g", "ml") and total >= 1000:
@@ -1796,16 +1835,29 @@ def api_inventarios_xlsx():
     hoja = libro.active
     hoja.title = "Inventarios"
     invs = filas(con.execute("SELECT * FROM inventarios ORDER BY id"))
+    # Producto y lote de cada lote que ya no estaba (cerrado) en cada inventario, para nombrarlos en la fila.
+    no_estaban = {}
+    for f in con.execute(
+            """SELECT il.inventario_id, l.lote, i.nombre AS ingrediente,
+                      (SELECT a.producto FROM recepciones r JOIN alias a ON a.id=r.alias_id WHERE r.lote_id=l.id
+                       ORDER BY r.fecha_ingreso DESC LIMIT 1) AS producto
+               FROM inventario_lotes il JOIN lotes l ON l.id=il.lote_id JOIN ingredientes i ON i.id=l.ingrediente_id
+               WHERE il.esta=0 ORDER BY il.inventario_id, i.nombre, l.lote"""):
+        no_estaban.setdefault(f["inventario_id"], []).append("%s | %s" % (f["producto"] or f["ingrediente"], f["lote"]))
     tabla(hoja, "Inventarios realizados",
-          ["FECHA Y HORA", "BODEGA", "REGISTRÓ", "TIPO", "LOTES REVISADOS", "SIGUEN EN BODEGA", "YA NO ESTABAN (SE CERRARON)", "COMENTARIO"],
+          ["FECHA Y HORA", "BODEGA", "REGISTRÓ", "TIPO", "LOTES REVISADOS", "SIGUEN EN BODEGA", "YA NO ESTABAN (SE CERRARON)",
+           "PRODUCTO | LOTE QUE YA NO ESTABA", "COMENTARIO"],
           [[fecha_hora(i["fecha_hora"]), lugares.get(i["lugar"], i["lugar"]), i["persona"],
-            "BAJA: YA NO ESTÁ" if i["tipo"] == "suelto" else "INVENTARIO", i["revisados"], i["revisados"] - i["cerrados"], i["cerrados"], i["nota"] or None]
-           for i in invs], [17, 20, 18, 18, 12, 12, 16, 30])
+            "BAJA: YA NO ESTÁ" if i["tipo"] == "suelto" else "INVENTARIO", i["revisados"], i["revisados"] - i["cerrados"], i["cerrados"],
+            "\n".join(no_estaban.get(i["id"], [])) or None, i["nota"] or None]
+           for i in invs], [17, 20, 18, 18, 12, 12, 16, 46, 30])
+    hoja["A3"] = "Cada lote revisado (también los que siguen en bodega) está en la hoja «Lotes revisados»."
+    hoja["A3"].font = Font(italic=True, color="6B5D52")
     detalle = filas(con.execute(
         """SELECT inv.fecha_hora, inv.lugar, inv.persona, il.esta, il.reabierto_en, il.reabierto_por, l.lote, i.nombre AS ingrediente,
                   (SELECT a.producto FROM recepciones r JOIN alias a ON a.id=r.alias_id WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS producto,
                   (SELECT r.proveedor FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS proveedor,
-                  COALESCE((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1), l.caducidad) AS caducidad
+                  COALESCE(NULLIF((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1), ''), NULLIF(l.caducidad, '')) AS caducidad
            FROM inventario_lotes il JOIN inventarios inv ON inv.id=il.inventario_id JOIN lotes l ON l.id=il.lote_id
            JOIN ingredientes i ON i.id=l.ingrediente_id ORDER BY inv.id, il.esta, i.nombre"""))
     hoja_d = libro.create_sheet("Lotes revisados")
@@ -1903,7 +1955,7 @@ def saldo_al(con, lote_id, lugar, hasta=None):
             "SELECT r.cantidad FROM recepciones r WHERE r.lote_id=? AND r.anulado=0 AND " + _TIEMPO_RECEPCION + " <= ?", (lote_id, t))]
         if None in cantidades:
             return 0
-        return (sum(cantidades) - q("SELECT SUM(cantidad) FROM traslados WHERE lote_id=? AND anulado=0 AND fecha_hora<=?")
+        return (sum(cantidades) - q("SELECT SUM(cantidad) FROM traslados WHERE lote_id=? AND anulado=0 AND inicial=0 AND fecha_hora<=?")
                 - q("SELECT SUM(cantidad) FROM salidas_areas WHERE lote_id=? AND anulado=0 AND fecha_hora<=?"))
     return (q("SELECT SUM(cantidad) FROM traslados WHERE lote_id=? AND anulado=0 AND fecha_hora<=?")
             - q("SELECT SUM(cantidad) FROM salidas_cocina WHERE lote_id=? AND anulado=0 AND fecha_hora<=?")
@@ -2062,7 +2114,7 @@ def api_salida_anular(salida_id):
     return jsonify(ok=True)
 
 
-MOTIVOS_BAJA = ("CADUCADO", "CONTAMINADO")
+MOTIVOS_BAJA = ("CADUCADO", "CONTAMINADO", "FALTANTE")      # FALTANTE: parte del lote que ya no está
 MOTIVO_NO_ESTA = "NO_ESTA"
 
 
@@ -2105,9 +2157,9 @@ def api_baja():
     lugar = d.get("lugar")
     motivo = str(d.get("motivo") or "").upper()
     comentario = " ".join(str(d.get("comentario") or "").split())
-    if motivo == MOTIVO_NO_ESTA:
+    if motivo == MOTIVO_NO_ESTA and lugar != "cocina":
         return baja_no_esta(con, d.get("lote_id"), lugar, persona, comentario)
-    if motivo not in MOTIVOS_BAJA:
+    if motivo not in MOTIVOS_BAJA and not (motivo == MOTIVO_NO_ESTA and lugar == "cocina"):
         raise ErrorApi("Elige el motivo.")
     lote = un_lote(con, d.get("lote_id"))
     unidad = lote["unidad"] or ""
@@ -2155,11 +2207,158 @@ def api_baja():
         if lote["origen"] == "interno":
             con.execute("UPDATE lotes SET agotado=1 WHERE id=?", (lote["id"],))
         vacio = True
-    anotar(con, persona, "BAJA", "%s lote %s dado de baja en %s por %s%s%s" % (
-        lote["ingrediente"], lote["lote"], donde, motivo.lower(), " (%s %s)" % (fmt(cantidad), unidad) if cantidad else "",
-        ": " + comentario if comentario else ""), lote["id"])
+    anotar(con, persona, "BAJA", "%s lote %s dado de baja en %s %s%s%s" % (
+        lote["ingrediente"], lote["lote"], donde, "porque ya no está" if motivo == MOTIVO_NO_ESTA
+        else "porque faltaban (ya no estaban)" if motivo == "FALTANTE" else "por " + motivo.lower(),
+        " (%s %s)" % (fmt(cantidad), unidad) if cantidad else "", ": " + comentario if comentario else ""), lote["id"])
     con.commit()
-    return jsonify(ok=True, vacio=vacio)
+    return jsonify(ok=True, vacio=vacio, no_esta=motivo == MOTIVO_NO_ESTA)
+
+
+def apertura_actual(con, lote_id):
+    ap = con.execute("SELECT * FROM aperturas WHERE lote_id=? AND cerrado_en IS NULL ORDER BY id DESC LIMIT 1", (lote_id,)).fetchone()
+    if not ap:
+        raise ErrorApi("Ese lote ya no está abierto en cocina.")
+    return ap
+
+
+@app.get("/api/cocina/lotes/<int:lote_id>")
+def api_cocina_lote(lote_id):
+    """Lo que se puede corregir de un lote en uso en cocina: lo último que se tomó, la caducidad y (si cocina lo anotó) el código."""
+    con = db()
+    lote = un_lote(con, lote_id)
+    ap = apertura_actual(con, lote_id)
+    ultima = con.execute("SELECT * FROM salidas_cocina WHERE lote_id=? AND anulado=0 AND fecha_hora>=? ORDER BY id DESC LIMIT 1",
+                         (lote_id, ap["abierto_en"])).fetchone()
+    recep = con.execute("SELECT 1 FROM recepciones WHERE lote_id=? AND anulado=0 AND COALESCE(caducidad,'')<>''", (lote_id,)).fetchone()
+    en_panes = con.execute("SELECT COUNT(DISTINCT li.produccion_id) FROM produccion_lotes pl JOIN produccion_lineas li ON li.id=pl.linea_id "
+                           "WHERE pl.lote_id=? AND pl.quitado_en IS NULL AND pl.agregado_en>=?", (lote_id, ap["abierto_en"])).fetchone()[0]
+    return jsonify(lote=lote, abierto_en=ap["abierto_en"], ultima=dict(ultima) if ultima else None,
+                   ultima_texto=cantidad_texto(ultima["cantidad"], lote) if ultima and lote["empaque"] else
+                   ("%s %s" % (fmt(ultima["cantidad"]), ultima["unidad"]) if ultima else None),
+                   caducidad_editable=not recep, codigo_editable=lote["origen"] in ("manual", "inventario"), en_panes=en_panes)
+
+
+@app.post("/api/cocina/lotes/<int:lote_id>/editar")
+def api_cocina_lote_editar(lote_id):
+    """Corregir un lote en uso en cocina: lo último que se tomó de bodega secundaria, su caducidad o su código."""
+    d = cuerpo()
+    persona = persona_de(d)
+    con = db()
+    lote = un_lote(con, lote_id)
+    ap = apertura_actual(con, lote_id)
+    cambios = []
+    if "cantidad" in d and str(d.get("cantidad") or "").strip():
+        ultima = con.execute("SELECT * FROM salidas_cocina WHERE lote_id=? AND anulado=0 AND fecha_hora>=? ORDER BY id DESC LIMIT 1",
+                             (lote_id, ap["abierto_en"])).fetchone()
+        if not ultima:
+            raise ErrorApi("No hay una salida de bodega secundaria que corregir en este lote.")
+        if d.get("en_unidades") and por_unidad(lote):
+            n = numero(d["cantidad"])
+            if n is None or n <= 0 or n != int(n):
+                raise ErrorApi("Escribe cuántos %s se tomaron (número entero)." % lote["unidad_contenido"])
+            nueva = n / lote["contenido"]
+        elif lote["empaque"]:
+            nueva = entero_paquetes(d["cantidad"], lote["empaque"], "lo que se tomó")
+        else:
+            nueva = numero(d["cantidad"])
+            if nueva is None or nueva <= 0:
+                raise ErrorApi("La cantidad debe ser solo un número.")
+        if abs(nueva - ultima["cantidad"]) > 1e-9:
+            disponible = lote["disponible_cocina"]
+            if disponible is not None and nueva - ultima["cantidad"] > disponible + 1e-9:
+                raise ErrorApi("En bodega secundaria solo quedan %s de este lote." % cantidad_texto(max(disponible, 0), lote))
+            con.execute("UPDATE salidas_cocina SET cantidad=? WHERE id=?", (nueva, ultima["id"]))
+            l2 = un_lote(con, lote_id)
+            if l2["disponible_cocina"] is not None and con.execute("SELECT 1 FROM traslados WHERE lote_id=? AND anulado=0", (lote_id,)).fetchone():
+                queda = round(l2["disponible_cocina"] * lote["contenido"]) if por_unidad(lote) else l2["disponible_cocina"]
+                con.execute("UPDATE lotes SET en_secundaria=? WHERE id=?", (1 if queda > 1e-9 else 0, lote_id))
+            cambios.append("cantidad: %s → %s" % (cantidad_texto(ultima["cantidad"], lote) if lote["empaque"] else fmt(ultima["cantidad"]),
+                                                  cantidad_texto(nueva, lote) if lote["empaque"] else fmt(nueva)))
+    if d.get("caducidad"):
+        if con.execute("SELECT 1 FROM recepciones WHERE lote_id=? AND anulado=0 AND COALESCE(caducidad,'')<>''", (lote_id,)).fetchone():
+            raise ErrorApi("La caducidad de este lote viene de su recepción en bodega principal: pide a bodega principal que la corrija.")
+        cad = fecha_valida(d["caducidad"], "fecha de caducidad")
+        if cad != (lote["caducidad"] or ""):
+            con.execute("UPDATE lotes SET caducidad=? WHERE id=?", (cad, lote_id))
+            cambios.append("caducidad: %s → %s" % (dia_texto(lote["caducidad"]) if lote["caducidad"] else "sin fecha", dia_texto(cad)))
+    codigo = str(d.get("lote") or "").strip()
+    unido = None
+    if codigo and codigo != lote["lote"]:
+        if lote["origen"] not in ("manual", "inventario"):
+            raise ErrorApi("El código de este lote viene de bodega: no se cambia desde cocina.")
+        otro = con.execute("SELECT id FROM lotes WHERE ingrediente_id=? AND lote=? AND id<>?", (lote["ingrediente_id"], codigo, lote_id)).fetchone()
+        if otro and not d.get("unir"):
+            raise ErrorApi("Ya existe el lote %s de %s." % (codigo, lote["ingrediente"]))
+        if otro:
+            unido = unir_lotes(con, lote_id, otro["id"], persona)
+            cambios.append("era el lote %s, que ya existía: se unieron" % codigo)
+        else:
+            con.execute("UPDATE lotes SET lote=? WHERE id=?", (codigo, lote_id))
+            cambios.append("código: %s → %s" % (lote["lote"], codigo))
+    if not cambios:
+        raise ErrorApi("No cambiaste nada.")
+    anotar(con, persona, "COCINA_CORREGIDO", "%s lote %s: %s" % (lote["ingrediente"], lote["lote"], "; ".join(cambios)), unido or lote_id)
+    con.commit()
+    return jsonify(ok=True, cambios=cambios, lote_id=unido or lote_id)
+
+
+TABLAS_CON_LOTE = ("aperturas", "produccion_lotes", "movimientos", "traslados", "bajas", "salidas_areas", "avisos",
+                   "salidas_cocina", "inventario_lotes")
+
+
+def unir_lotes(con, origen_id, destino_id, persona):
+    """El lote que anotó cocina (origen) era en realidad uno que ya existía (destino): todo lo del origen pasa al destino
+    (aperturas, panes, salidas...) y el origen se borra. El destino conserva su código y su caducidad."""
+    origen = un_lote(con, origen_id)
+    destino = un_lote(con, destino_id)
+    if con.execute("SELECT 1 FROM recepciones WHERE lote_id=? AND anulado=0", (origen_id,)).fetchone():
+        raise ErrorApi("El lote %s ya tiene recepción en bodega principal: no se puede unir desde cocina." % origen["lote"])
+    # Cocina: si el destino ya estaba abierto, la apertura del origen se cierra; si no, pasa al destino.
+    for ap in con.execute("SELECT * FROM aperturas WHERE lote_id=? AND cerrado_en IS NULL", (origen_id,)).fetchall():
+        if con.execute("SELECT 1 FROM aperturas WHERE lote_id=? AND cerrado_en IS NULL", (destino_id,)).fetchone():
+            con.execute("UPDATE aperturas SET cerrado_en=?, cerrado_por=? WHERE id=?", (ahora(), persona, ap["id"]))
+    # Panes: si una línea ya tenía el destino, el renglón del origen sobra.
+    for pl in con.execute("SELECT id, linea_id FROM produccion_lotes WHERE lote_id=?", (origen_id,)).fetchall():
+        if con.execute("SELECT 1 FROM produccion_lotes WHERE linea_id=? AND lote_id=? AND quitado_en IS NULL", (pl["linea_id"], destino_id)).fetchone():
+            con.execute("DELETE FROM produccion_lotes WHERE id=?", (pl["id"],))
+    for t in TABLAS_CON_LOTE:
+        con.execute("UPDATE %s SET lote_id=? WHERE lote_id=?" % t, (destino_id, origen_id))
+    if con.execute("SELECT 1 FROM aperturas WHERE lote_id=? AND cerrado_en IS NULL", (destino_id,)).fetchone():
+        con.execute("UPDATE lotes SET agotado=0 WHERE id=?", (destino_id,))
+    if origen["en_secundaria"]:
+        con.execute("UPDATE lotes SET en_secundaria=1 WHERE id=?", (destino_id,))
+    con.execute("DELETE FROM lotes WHERE id=?", (origen_id,))
+    anotar(con, persona, "LOTES_UNIDOS", "%s: el lote %s que anotó cocina era el %s, que ya existía; se unieron" % (
+        origen["ingrediente"], origen["lote"], destino["lote"]), destino_id)
+    return destino_id
+
+
+@app.post("/api/cocina/lotes/<int:lote_id>/deshacer")
+def api_cocina_lote_deshacer(lote_id):
+    """Se registró por error: el lote sale de cocina como si no se hubiera abierto y lo tomado vuelve a bodega secundaria."""
+    d = cuerpo()
+    persona = persona_de(d)
+    con = db()
+    lote = un_lote(con, lote_id)
+    ap = apertura_actual(con, lote_id)
+    panes = con.execute("""SELECT DISTINCT p.producto, p.lote_final FROM produccion_lotes pl JOIN produccion_lineas li ON li.id=pl.linea_id
+                           JOIN producciones p ON p.id=li.produccion_id
+                           WHERE pl.lote_id=? AND pl.quitado_en IS NULL AND pl.agregado_en>=? AND p.estado<>'anulada'""",
+                        (lote_id, ap["abierto_en"])).fetchall()
+    if panes:
+        raise ErrorApi("Este lote ya se anotó en %s. Si no se usó ahí, quítalo desde esa hoja de producción; si ya no está, usa «Dar de baja»."
+                       % ", ".join("%s %s" % (p["producto"], p["lote_final"]) for p in panes))
+    salidas = con.execute("SELECT id FROM salidas_cocina WHERE lote_id=? AND anulado=0 AND fecha_hora>=?", (lote_id, ap["abierto_en"])).fetchall()
+    for s_ in salidas:
+        con.execute("UPDATE salidas_cocina SET anulado=1 WHERE id=?", (s_["id"],))
+    con.execute("UPDATE aperturas SET cerrado_en=abierto_en, cerrado_por=? WHERE id=?", (persona + " (registrado por error)", ap["id"]))
+    if salidas and con.execute("SELECT 1 FROM traslados WHERE lote_id=? AND anulado=0", (lote_id,)).fetchone():
+        con.execute("UPDATE lotes SET en_secundaria=1, agotado=0 WHERE id=?", (lote_id,))
+    anotar(con, persona, "COCINA_DESHECHO", "%s lote %s: se registró por error en cocina%s" % (
+        lote["ingrediente"], lote["lote"], "; lo tomado vuelve a bodega secundaria" if salidas else ""), lote_id)
+    con.commit()
+    return jsonify(ok=True, devuelto=bool(salidas))
 
 
 @app.post("/api/bajas/<int:baja_id>/anular")
@@ -2210,7 +2409,12 @@ def api_recepcion_nueva():
         raise ErrorApi("«%s» no está en la lista de productos. Elígelo de la lista o agrégalo con «Agregar producto nuevo»." % producto)
     alias_id = alias["id"]
     if not alias["empaque"]:
-        raise ErrorApi("«%s» no tiene empaque. Defínelo en Administrar > Productos de bodega > Empaque." % producto)
+        raise ErrorApi("«%s» no tiene empaque. Defínelo en Administrar > Productos de bodega > Cantidad." % producto)
+    if alias["ignorar"] or not alias["ingrediente_id"]:
+        # Todo lo que llega a bodega principal se ve en el inventario y en todas las áreas: recibe su propio ingrediente.
+        con.execute("UPDATE alias SET ignorar=0 WHERE id=?", (alias_id,))
+        ingrediente_propio(con, alias_id)
+        alias = con.execute("SELECT * FROM alias WHERE id=?", (alias_id,)).fetchone()
     v["unidad"] = alias["empaque"]
     v["cantidad"] = str(entero_paquetes(v["cantidad"], alias["empaque"], "la cantidad"))
     previo = con.execute("SELECT origen FROM lotes WHERE ingrediente_id=? AND lote=?",
@@ -2366,6 +2570,30 @@ def api_recepcion_anular(rid):
     return jsonify(ok=True)
 
 
+def miniatura_excel(ruta_relativa, alto=100):
+    """Imagen pequeña de una foto guardada (fotos/<ruta>) para ponerla en una celda de Excel, o None si no hay."""
+    if not ruta_relativa:
+        return None
+    ruta = os.path.join(FOTOS, ruta_relativa)
+    if not os.path.isfile(ruta):
+        return None
+    try:
+        from PIL import Image as Pil
+        from openpyxl.drawing.image import Image as ImagenExcel
+        foto = Pil.open(ruta).convert("RGB")
+        # Se guarda nítida (hasta 1400 px) y solo se MUESTRA pequeña en la celda: con zoom se lee bien.
+        foto.thumbnail((1400, 1400))
+        datos = io.BytesIO()
+        foto.save(datos, "JPEG", quality=88)
+        datos.seek(0)
+        img = ImagenExcel(datos)
+        escala = min(120 / foto.width, alto / foto.height)
+        img.width, img.height = round(foto.width * escala), round(foto.height * escala)
+        return img
+    except Exception:
+        return None
+
+
 @app.get("/api/recepciones.xlsx")
 def api_recepciones_xlsx():
     """El registro del mes en el mismo formato BPM-SFFS-RRMP001 (sin las filas anuladas)."""
@@ -2398,7 +2626,7 @@ def api_recepciones_xlsx():
         hoja[celda] = valor
     titulos = ["FECHA INGRESO", "PRODUCTO", "PROVEEDOR", "LOTE", "CANTIDAD", "UNIDAD DE MEDIDA",
                "APARIENCIA VISUAL PRODUCTO*", "CONDICIONES DE TRANSPORTE**", "APROBADO POR", "OBSERVACIONES", "",
-               "FECHA DE CADUCIDAD"]
+               "FECHA DE CADUCIDAD", "FOTO DEL LOTE", "FOTO DE LA REQUISICIÓN"]
     for c, t in enumerate(titulos, 1):
         hoja.cell(row=5, column=c, value=t)
     hoja.merge_cells("J5:K5")
@@ -2426,14 +2654,31 @@ def api_recepciones_xlsx():
         hoja.cell(row=n, column=1).number_format = "mm-dd-yy"     # fecha corta segun la configuracion de Windows
         hoja.cell(row=n, column=12).number_format = "mm-dd-yy"
         hoja.cell(row=n, column=4).number_format = "@"
+        # Fotos de la etiqueta del lote y de la requisición: solo si se tomaron (miniatura dentro de la celda).
+        con_foto = False
+        for col, campo in ((13, "foto_lote"), (14, "foto_requisicion")):
+            img = miniatura_excel(r.get(campo))
+            if img:
+                # Anclada de esquina a esquina dentro de la celda (centrada), para que no se corra en Excel ni en LibreOffice.
+                from openpyxl.drawing.spreadsheet_drawing import TwoCellAnchor, AnchorMarker
+                emu = 9525                                      # EMU por pixel
+                x, y = max(0, (124 - img.width) // 2), max(0, (109 - img.height) // 2)
+                img.anchor = TwoCellAnchor(editAs="oneCell",
+                                           _from=AnchorMarker(col=col - 1, colOff=x * emu, row=n - 1, rowOff=y * emu),
+                                           to=AnchorMarker(col=col - 1, colOff=(x + img.width) * emu,
+                                                           row=n - 1, rowOff=(y + img.height) * emu))
+                hoja.add_image(img)
+                con_foto = True
+        if con_foto:
+            hoja.row_dimensions[n].height = 82
     fino = Side(style="thin", color="000000")
-    for fila in hoja.iter_rows(min_row=1, max_row=max(n, 6), min_col=1, max_col=12):
+    for fila in hoja.iter_rows(min_row=1, max_row=max(n, 6), min_col=1, max_col=14):
         for celda in fila:
             if celda.row == 4:
                 continue
             celda.border = Border(left=fino, right=fino, top=fino, bottom=fino)
             celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for c, ancho in enumerate([12, 38, 30, 18, 11, 13, 13, 15, 11, 18, 18, 13], 1):
+    for c, ancho in enumerate([12, 38, 30, 18, 11, 13, 13, 15, 11, 18, 18, 13, 17, 17], 1):
         hoja.column_dimensions[openpyxl.utils.get_column_letter(c)].width = ancho
     hoja.row_dimensions[5].height = 45
     salida = io.BytesIO()
@@ -2451,7 +2696,7 @@ SELECT l.id, l.lote, l.origen, l.en_secundaria, l.agotado, l.revisar, l.nota, l.
        l.ingrediente_id, i.nombre AS ingrediente, i.tipo, i.refrigerado,
        (SELECT r.proveedor FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS proveedor,
        (SELECT MAX(r.fecha_ingreso) FROM recepciones r WHERE r.lote_id=l.id) AS fecha_ingreso,
-       COALESCE((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1), l.caducidad) AS caducidad,
+       COALESCE(NULLIF((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1), ''), NULLIF(l.caducidad, '')) AS caducidad,
        (SELECT r.cantidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS cantidad,
        (SELECT a.producto FROM recepciones r JOIN alias a ON a.id=r.alias_id WHERE r.lote_id=l.id
         ORDER BY r.fecha_ingreso DESC LIMIT 1) AS producto_bodega,
@@ -2459,12 +2704,15 @@ SELECT l.id, l.lote, l.origen, l.en_secundaria, l.agotado, l.revisar, l.nota, l.
        (SELECT ap.abierto_por FROM aperturas ap WHERE ap.lote_id=l.id AND ap.cerrado_en IS NULL LIMIT 1) AS abierto_por,
        (SELECT COALESCE(SUM(t.cantidad), 0) FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0) AS trasladado,
        (SELECT COUNT(*) FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0) AS n_traslados,
+       (SELECT COALESCE(SUM(t.cantidad), 0) FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0 AND t.inicial=1) AS trasladado_inicial,
        (SELECT COALESCE(SUM(s.cantidad), 0) FROM salidas_cocina s WHERE s.lote_id=l.id AND s.anulado=0) AS a_cocina,
        (SELECT GROUP_CONCAT(r.cantidad, '|') FROM recepciones r WHERE r.lote_id=l.id) AS cantidades,
        COALESCE((SELECT r.unidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1),
                 (SELECT t.unidad FROM traslados t WHERE t.lote_id=l.id AND t.anulado=0 ORDER BY t.id DESC LIMIT 1)) AS unidad,
+       COALESCE((SELECT r.foto_lote FROM recepciones r WHERE r.lote_id=l.id AND r.foto_lote IS NOT NULL AND r.anulado=0
+        ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1), NULLIF(l.foto, '')) AS foto_recepcion,
        (SELECT r.foto_lote FROM recepciones r WHERE r.lote_id=l.id AND r.foto_lote IS NOT NULL AND r.anulado=0
-        ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1) AS foto_recepcion,
+        ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1) IS NOT NULL AS foto_de_principal,
        COALESCE((SELECT a.empaque || '|' || a.contenido || '|' || a.unidad_contenido FROM recepciones r JOIN alias a ON a.id=r.alias_id
         WHERE r.lote_id=l.id AND COALESCE(a.empaque,'')<>'' ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1),
                 (SELECT a.empaque || '|' || a.contenido || '|' || a.unidad_contenido FROM alias a
@@ -2521,7 +2769,8 @@ def con_saldo(lote):
     lote["a_cocina"] = round(lote.get("a_cocina") or 0, 3)
     lote["otras_areas"] = round(lote.get("otras_areas") or 0, 3)
     # Lo que queda en bodega principal: recibido - lo que paso a panaderia - lo despachado a otras areas.
-    lote["disponible"] = (round(lote["recibido"] - lote["trasladado"] - lote["otras_areas"], 3)
+    # Lo cargado en el inventario de bodega secundaria (inicial) no salio de bodega principal.
+    lote["disponible"] = (round(lote["recibido"] - (lote["trasladado"] - (lote.pop("trasladado_inicial", 0) or 0)) - lote["otras_areas"], 3)
                           if lote["recibido"] is not None else None)
     lote.update(semaforo_caducidad(lote.get("caducidad"), lote.get("origen") == "interno"))
     partes_emp = (lote.pop("empaque_txt", None) or "").split("|")
@@ -2710,9 +2959,13 @@ def recipientes_abiertos(con, ingrediente_id=None):
     """Lo que hay ahora en cada recipiente de cocina: lotes abiertos agrupados por ingrediente y recipiente."""
     filas_ = con.execute(
         """SELECT ap.recipiente, ap.abierto_en, ap.abierto_por, l.id AS lote_id, l.lote, l.origen,
-                  COALESCE((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1),
-                           l.caducidad) AS caducidad,
-                  i.id AS ingrediente_id, i.nombre AS ingrediente, i.recipientes, i.tipo
+                  COALESCE(NULLIF((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1), ''),
+                           NULLIF(l.caducidad, '')) AS caducidad,
+                  i.id AS ingrediente_id, i.nombre AS ingrediente, i.recipientes, i.tipo,
+                  COALESCE((SELECT r.foto_lote FROM recepciones r WHERE r.lote_id=l.id AND r.foto_lote IS NOT NULL AND r.anulado=0
+                   ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1), NULLIF(l.foto, '')) AS foto_recepcion,
+       (SELECT r.foto_lote FROM recepciones r WHERE r.lote_id=l.id AND r.foto_lote IS NOT NULL AND r.anulado=0
+                   ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1) IS NOT NULL AS foto_de_principal
            FROM aperturas ap JOIN lotes l ON l.id=ap.lote_id JOIN ingredientes i ON i.id=l.ingrediente_id
            WHERE ap.cerrado_en IS NULL""" + (" AND i.id=?" if ingrediente_id else "") +
         " ORDER BY i.nombre, ap.recipiente, ap.abierto_en", (ingrediente_id,) if ingrediente_id else ()).fetchall()
@@ -2722,6 +2975,7 @@ def recipientes_abiertos(con, ingrediente_id=None):
             "ingrediente_id": f["ingrediente_id"], "ingrediente": f["ingrediente"], "recipiente": f["recipiente"],
             "n_recipientes": f["recipientes"], "tipo": f["tipo"], "lotes": []})
         g["lotes"].append(dict({"id": f["lote_id"], "lote": f["lote"], "origen": f["origen"], "caducidad": f["caducidad"],
+                                "foto_recepcion": f["foto_recepcion"],
                                 "abierto_en": f["abierto_en"], "abierto_por": f["abierto_por"]},
                                **semaforo_caducidad(f["caducidad"], f["origen"] == "interno")))
     for g in grupos.values():
@@ -2805,11 +3059,20 @@ def api_abrir():
             cantidad = numero(item.get("cantidad"))
             if cantidad is None or cantidad <= 0:
                 raise ErrorApi("Escribe cuánto del lote %s toma cocina (solo el número)." % lote["lote"])
-            if lote["empaque"]:
-                cantidad = entero_paquetes(item.get("cantidad"), lote["empaque"], "lo que toma cocina del lote %s" % lote["lote"])
             disponible = lote["disponible_cocina"]
-            if disponible is not None and cantidad > disponible + 1e-9:
-                raise ErrorApi("Del lote %s solo hay %s en bodega secundaria." % (lote["lote"], cantidad_texto(max(disponible, 0), lote)))
+            if item.get("en_unidades") and por_unidad(lote):
+                # De a uno: 10 huevos = 10/30 de cubeta. Se compara en unidades para no arrastrar decimales.
+                sueltas = numero(item.get("cantidad"))
+                if sueltas is None or sueltas <= 0 or sueltas != int(sueltas):
+                    raise ErrorApi("Escribe cuántos %s toma cocina del lote %s (número entero)." % (lote["unidad_contenido"], lote["lote"]))
+                if disponible is not None and sueltas > round(disponible * lote["contenido"]) + 1e-9:
+                    raise ErrorApi("Del lote %s solo hay %s en bodega secundaria." % (lote["lote"], cantidad_texto(max(disponible, 0), lote)))
+                cantidad = sueltas / lote["contenido"]
+            else:
+                if lote["empaque"]:
+                    cantidad = entero_paquetes(item.get("cantidad"), lote["empaque"], "lo que toma cocina del lote %s" % lote["lote"])
+                if disponible is not None and cantidad > disponible + 1e-9:
+                    raise ErrorApi("Del lote %s solo hay %s en bodega secundaria." % (lote["lote"], cantidad_texto(max(disponible, 0), lote)))
         if lote["semaforo"] == "rojo":
             raise ErrorApi("El lote %s de %s está caducado (%s): no se puede usar. Dalo de baja." % (
                 lote["lote"], lote["ingrediente"], dia_texto(lote["caducidad"])))
@@ -2819,11 +3082,13 @@ def api_abrir():
             unidad = lote["unidad"] or ""
             con.execute("INSERT INTO salidas_cocina(lote_id,cantidad,unidad,fecha_hora,persona) VALUES(?,?,?,?,?)",
                         (lote["id"], cantidad, unidad, ahora(), persona))
-            if disponible is not None and cantidad >= disponible - 1e-9:
+            queda = None if disponible is None else (round((disponible - cantidad) * lote["contenido"]) if por_unidad(lote)
+                                                     else disponible - cantidad)
+            if queda is not None and queda <= 1e-9:
                 # Se tomo todo lo que habia: el lote ya no esta en bodega secundaria.
                 con.execute("UPDATE lotes SET en_secundaria=0 WHERE id=?", (lote["id"],))
-            anotar(con, persona, "SALIDA_COCINA", "%s lote %s: %s %s" % (lote["ingrediente"], lote["lote"], fmt(cantidad), unidad),
-                   lote["id"])
+            anotar(con, persona, "SALIDA_COCINA", "%s lote %s: %s" % (lote["ingrediente"], lote["lote"],
+                   cantidad_texto(cantidad, lote) if por_unidad(lote) else "%s %s" % (fmt(cantidad), unidad)), lote["id"])
     con.commit()
     return jsonify(ok=True, anteriores=anteriores_de(con, puestos))
 
@@ -2867,6 +3132,9 @@ def api_lote_manual():
     except ValueError:
         raise ErrorApi("Escribe la fecha de caducidad que dice el empaque.")
     existente = con.execute("SELECT id FROM lotes WHERE ingrediente_id=? AND lote=?", (ing["id"], codigo)).fetchone()
+    if existente and con.execute("SELECT 1 FROM recepciones WHERE lote_id=? AND anulado=0", (existente["id"],)).fetchone():
+        # El lote SÍ está registrado en bodega principal: alguien lo sacó de allí directamente, sin pasar por bodega secundaria.
+        return salida_directa_principal(con, ing, existente["id"], cantidad, unidad, emp, datos, persona)
     if existente:
         lote_id = existente["id"]
         con.execute("UPDATE lotes SET agotado=0 WHERE id=?", (lote_id,))
@@ -2911,6 +3179,46 @@ def api_lote_manual():
             con.execute("UPDATE lotes SET en_secundaria=0 WHERE id=?", (lote_id,))     # cocina se lo llevo todo
     con.commit()
     return jsonify(ok=True, lote_id=lote_id, anteriores=anteriores)
+
+
+def salida_directa_principal(con, ing, lote_id, cantidad, unidad, emp, datos, persona):
+    """Un operario tomó el lote directamente de bodega principal (no pasó por bodega secundaria). Se registra el paso por
+    bodega secundaria (y la salida a cocina si lo anota cocina), se descuenta de bodega principal y se le avisa, solo para
+    que revise que coincida: la recepción ya existe, así que no queda «por revisar»."""
+    lote = un_lote(con, lote_id)
+    disponible = lote.get("disponible")
+    texto_cant = cantidad_texto(cantidad, lote) if lote.get("empaque") else "%s %s" % (fmt(cantidad), unidad)
+    con.execute("INSERT INTO traslados(lote_id,cantidad,unidad,fecha_hora,persona) VALUES(?,?,?,?,?)", (lote_id, cantidad, unidad, ahora(), persona))
+    con.execute("UPDATE lotes SET en_secundaria=1, agotado=0 WHERE id=?", (lote_id,))
+    if datos.get("destino") == "cocina":
+        con.execute("INSERT INTO salidas_cocina(lote_id,cantidad,unidad,fecha_hora,persona) VALUES(?,?,?,?,?)", (lote_id, cantidad, unidad, ahora(), persona))
+    queda = None if disponible is None else disponible - cantidad
+    if queda is not None and queda <= 1e-9:
+        con.execute("UPDATE lotes SET principal_vacio=1 WHERE id=?", (lote_id,))
+    mas_de_lo_que_habia = queda is not None and queda < -1e-9
+    if mas_de_lo_que_habia:
+        con.execute("UPDATE lotes SET revisar=1, nota=TRIM(COALESCE(nota,'') || ' ' || ?) WHERE id=?",
+                    ("Se sacó de bodega principal más de lo que la app tenía registrado: revisar cantidades.", lote_id))
+    donde = "cocina" if datos.get("destino") == "cocina" else "bodega secundaria"
+    nota = str(datos.get("nota") or "").strip()
+    texto = ("%s sacó %s del lote %s de %s directamente de bodega principal para %s (no pasó por bodega secundaria). "
+             "Ya se descontó: %s.%s" % (
+                 persona, texto_cant, lote["lote"], ing["nombre"], donde,
+                 "OJO, la app tenía registrado menos de lo que se sacó: revisa la recepción" if mas_de_lo_que_habia
+                 else "en bodega principal quedan %s; revisa que coincida" % cantidad_texto(max(queda, 0), lote) if queda is not None and lote.get("empaque")
+                 else "revisa que coincida", (" Comentario: «%s»." % nota) if nota else ""))
+    con.execute("INSERT INTO avisos(area,lote_id,texto,creado_en,creado_por,tipo) VALUES(?,?,?,?,?,?)",
+                ("bodega", lote_id, texto, ahora(), persona, "directo_principal"))
+    anotar(con, persona, "SALIDA_DIRECTA", "%s lote %s: %s sacado directamente de bodega principal para %s" % (
+        ing["nombre"], lote["lote"], texto_cant, donde), lote_id)
+    anteriores = []
+    if datos.get("destino") == "cocina":
+        if abrir_lote(con, un_lote(con, lote_id), persona):
+            anteriores = anteriores_de(con, [(lote_id, ing["id"], 1)])
+        if (un_lote(con, lote_id).get("disponible_cocina") or 0) <= 1e-9:
+            con.execute("UPDATE lotes SET en_secundaria=0 WHERE id=?", (lote_id,))
+    con.commit()
+    return jsonify(ok=True, lote_id=lote_id, anteriores=anteriores, de_principal=True)
 
 
 @app.post("/api/lotes/<int:lote_id>/foto")
@@ -2970,7 +3278,12 @@ def hoja_de(con, produccion_id):
                       pl.quitado_en, pl.quitado_por, pl.motivo, l.lote, l.origen AS origen_lote, l.revisar,
                       (SELECT r.proveedor FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS proveedor,
                       (SELECT MAX(r.fecha_ingreso) FROM recepciones r WHERE r.lote_id=l.id) AS fecha_ingreso,
-                      (SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1) AS caducidad
+                      COALESCE(NULLIF((SELECT r.caducidad FROM recepciones r WHERE r.lote_id=l.id ORDER BY r.fecha_ingreso DESC LIMIT 1), ''),
+                               NULLIF(l.caducidad, '')) AS caducidad,
+                      COALESCE((SELECT r.foto_lote FROM recepciones r WHERE r.lote_id=l.id AND r.foto_lote IS NOT NULL AND r.anulado=0
+                   ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1), NULLIF(l.foto, '')) AS foto_recepcion,
+       (SELECT r.foto_lote FROM recepciones r WHERE r.lote_id=l.id AND r.foto_lote IS NOT NULL AND r.anulado=0
+                   ORDER BY r.fecha_ingreso DESC, r.id DESC LIMIT 1) IS NOT NULL AS foto_de_principal
                FROM produccion_lotes pl JOIN lotes l ON l.id=pl.lote_id
                WHERE pl.linea_id=? ORDER BY pl.id""", (li["id"],)))
         vigentes = [l for l in li["lotes"] if not l["quitado_en"]]
@@ -3104,14 +3417,16 @@ def api_producciones_xlsx():
     h1.title = "Hojas de producción"
     tabla(h1, "Hojas de producción",
           ["FECHA ELABORACIÓN", "PRODUCTO", "LOTE", "TIPO", "ESTADO", "VENCE", "INICIO DE MASA", "MASA LISTA", "FIN DE PRODUCCIÓN",
-           "HOJA CERRADA", "UNIDADES PRODUCIDAS", "UNIDADES PARA EL LOTE", "UNIDAD", "HORNEADO", "ETIQUETAS", "OBSERVACIONES", "RESPONSABLE"],
+           "HOJA CERRADA", "UNIDADES PRODUCIDAS", "PESO POR UNIDAD (G)", "PARA CONGELADOS", "PARA UNIVERSIDAD", "UNIDAD", "HORNEADO",
+           "ETIQUETAS", "OBSERVACIONES", "RESPONSABLE"],
           [[dt.date.fromisoformat(p["fecha"]).strftime("%d/%m/%Y"), p["producto"], p["lote_final"],
             "Mix Bread" if p["armado"] else "Subreceta" if p["produce_ingrediente_id"] else "Pan",
             estados.get(p["estado"], p["estado"]), dt.date.fromisoformat(p["fecha_vencimiento"]).strftime("%d/%m/%Y") if p.get("fecha_vencimiento") else None,
             t(p["iniciado_en"]), t(p.get("masa_lista_en")), t(p["terminado_en"]), t(p.get("completado_en")),
-            p["unidades"] or None, p.get("unidades_lote") or None, p.get("unidad_sub") or None, p["horneado"] or None,
+            p["unidades"] or None, p.get("gramos_unidad") or None, p.get("unidades_lote") or None, p.get("unidades_universidad") or None,
+            p.get("unidad_sub") or None, p["horneado"] or None,
             p["n_etiquetas"], p["observaciones"] or None, p["iniciado_por"]] for p in hojas],
-          [13, 28, 14, 11, 15, 12, 16, 16, 16, 16, 12, 12, 9, 18, 10, 30, 16])
+          [13, 28, 14, 11, 15, 12, 16, 16, 16, 16, 12, 11, 12, 12, 9, 18, 10, 30, 16])
     filas_ing = []
     for p in hojas:
         for li in p["lineas"]:
@@ -3408,17 +3723,27 @@ def api_guardar(pid):
         raise ErrorApi("El número de etiquetas debe ser un número entero.")
     unidades = str(datos.get("unidades", p["unidades"]) or "").strip()
     unidades_lote = str(datos.get("unidades_lote", p["unidades_lote"]) or "").strip()
+    gramos = str(datos.get("gramos_unidad", p.get("gramos_unidad")) or "").strip()
+    universidad = str(datos.get("unidades_universidad", p.get("unidades_universidad")) or "").strip()
+    if not p["produce_ingrediente_id"]:
+        for valor, nombre in ((unidades, "las unidades producidas"), (unidades_lote, "las unidades congeladas"),
+                              (universidad, "las unidades para la universidad")):
+            if valor and not re.fullmatch(r"\d+", valor):
+                raise ErrorApi("Escribe %s solo con números enteros." % nombre)
+        if gramos and (numero(gramos) is None or numero(gramos) <= 0):
+            raise ErrorApi("El peso por unidad debe ser solo un número (gramos), ej. 40.")
     if p["produce_ingrediente_id"]:
         # Subreceta: solo la cantidad total producida (opcional). El lote se cierra cuando cocina toca "Se terminó".
         unidad_sub = " ".join(str(datos.get("unidad_sub", p["unidad_sub"]) or "").upper().split())
         if unidades and numero(unidades) is None:
             raise ErrorApi("La cantidad total producida debe ser solo un número.")
         con.execute("UPDATE producciones SET unidad_sub=? WHERE id=?", (unidad_sub, pid))
-    total, propio = numero(unidades), numero(unidades_lote)
-    if total is not None and (propio or 0) + p["unidades_mix"] > total + 1e-9:
-        raise ErrorApi("Las unidades del lote (%s) más las usadas en Mix Bread (%s) suman más que lo producido (%s)." % (
-            fmt(propio or 0), fmt(p["unidades_mix"]), fmt(total)))
-    con.execute("UPDATE producciones SET unidades_lote=? WHERE id=?", (unidades_lote, pid))
+    total, propio, univ = numero(unidades), numero(unidades_lote), numero(universidad)
+    if total is not None and (propio or 0) + (univ or 0) + p["unidades_mix"] > total + 1e-9:
+        raise ErrorApi("Para congelados (%s) + para universidad (%s) + Mix Bread (%s) suman más que lo producido (%s)." % (
+            fmt(propio or 0), fmt(univ or 0), fmt(p["unidades_mix"]), fmt(total)))
+    con.execute("UPDATE producciones SET unidades_lote=?, gramos_unidad=?, unidades_universidad=? WHERE id=?",
+                (unidades_lote, gramos, universidad, pid))
     con.execute("UPDATE producciones SET unidades=?, horneado=?, observaciones=?, n_etiquetas=? WHERE id=?",
                 (unidades,
                  str(datos.get("horneado", p["horneado"]) or "").strip(),
@@ -3444,11 +3769,18 @@ def api_guardar(pid):
         if p["produce_ingrediente_id"]:
             pass        # subrecetas (relleno, glace, masa madre): la cantidad es opcional
         else:
-            for campo, nombre in (("unidades", "unidades producidas"), ("unidades_lote", "unidades para el lote"), ("horneado", "horneado")):
-                if not str(p[campo] or "").strip():
+            for campo, nombre in (("unidades", "unidades producidas"), ("gramos_unidad", "peso por unidad"),
+                                  ("unidades_lote", "para congelados"), ("unidades_universidad", "para universidad"),
+                                  ("horneado", "horneado")):
+                if not str(p.get(campo) or "").strip():
                     vacios.append(nombre)
-            if not p["n_etiquetas"]:
-                vacios.append("etiquetas a imprimir")
+            t_, c_, u_ = numero(p["unidades"]), numero(p["unidades_lote"]), numero(p.get("unidades_universidad"))
+            if not vacios and t_ is not None and abs((c_ or 0) + (u_ or 0) + p["unidades_mix"] - t_) > 1e-9:
+                con.commit()
+                raise ErrorApi("Guardado, pero la hoja no cuadra: se produjeron %s y suman %s (congelados %s + universidad %s%s). "
+                               "Corrige las cantidades para cerrarla." % (
+                                   fmt(t_), fmt((c_ or 0) + (u_ or 0) + p["unidades_mix"]), fmt(c_ or 0), fmt(u_ or 0),
+                                   " + Mix Bread %s" % fmt(p["unidades_mix"]) if p["unidades_mix"] else ""))
         sin_cantidad = [] if p["produce_ingrediente_id"] else [
             li["etiqueta"] for li in p["lineas"] if not li["no_utilizado"] and not str(li["cantidad"] or "").strip()]
         if sin_cantidad:
@@ -3539,7 +3871,7 @@ def disponibles_mix(con, producto_id):
     for comp in con.execute("""SELECT pr.id, pr.nombre FROM composicion c JOIN productos pr ON pr.id=c.componente_id
                                WHERE c.producto_id=? ORDER BY c.orden""", (producto_id,)).fetchall():
         lotes = filas(con.execute(
-            """SELECT p.id, p.producto, p.lote_final, p.fecha, p.estado, p.unidades, p.unidades_lote, p.vence, pr.vida_util_meses,
+            """SELECT p.id, p.producto, p.lote_final, p.fecha, p.estado, p.unidades, p.unidades_lote, p.unidades_universidad, p.vence, pr.vida_util_meses,
                       (SELECT COALESCE(SUM(al.unidades),0) FROM armado_lotes al JOIN producciones m ON m.id=al.produccion_id
                        WHERE al.origen_id=p.id AND m.estado<>'anulada') AS usado_mix
                FROM producciones p JOIN productos pr ON pr.id=p.producto_id
@@ -3548,7 +3880,8 @@ def disponibles_mix(con, producto_id):
         for l in lotes:
             total, propio = numero(l["unidades"]), numero(l["unidades_lote"])
             l["usado_mix"] = round(l["usado_mix"], 3)
-            l["disponible"] = round(total - (propio or 0) - l["usado_mix"], 3) if total is not None else None
+            l["disponible"] = (round(total - (propio or 0) - (numero(l["unidades_universidad"]) or 0) - l["usado_mix"], 3)
+                               if total is not None else None)
             l["fecha_vencimiento"] = vencimiento(l)
         grupos.append({"producto_id": comp["id"], "producto": comp["nombre"], "lotes": lotes})
     return dict(mix), grupos
@@ -3614,7 +3947,7 @@ def etiquetas_de(con, desde=None, hasta=None):
     if hasta:
         donde.append("p.fecha<=?"); args.append(hasta)
     datos = filas(con.execute(
-        """SELECT p.id, p.producto, p.lote_final, p.fecha, p.estado, p.n_etiquetas, p.unidades, p.vence,
+        """SELECT p.id, p.producto, p.lote_final, p.fecha, p.estado, p.n_etiquetas, p.unidades, p.vence, p.paquetes_confirmados_en,
                   pr.vida_util_meses, pr.vida_util_dias, pr.produce_ingrediente_id
            FROM producciones p JOIN productos pr ON pr.id=p.producto_id
            WHERE %s ORDER BY p.fecha, p.id""" % " AND ".join(donde), args))
@@ -3653,11 +3986,16 @@ def filas_etiquetas(con):
     historial = a.get("todo") == "1"
     con_sub = a.get("subrecetas") == "1" or historial
     ids = {int(x) for x in a.get("ids", "").split(",") if x.strip().isdigit()}
+    cantidades = {}                                  # id:n elegidos en la pantalla Etiquetas
+    for par in a.get("cantidades", "").split(","):
+        k, _, v = par.partition(":")
+        if k.strip().isdigit() and v.strip().isdigit():
+            cantidades[int(k)] = int(v)
     salida = [["LOTE", "PRODUCTO", "FE", "FV", "CANTIDAD"] + (["TIPO", "HOJA"] if historial else [])]
     for d in etiquetas_de(con, desde, hasta):
         if (d["es_subreceta"] and not con_sub) or (ids and d["id"] not in ids):
             continue
-        fila = [d["lote_final"], d["producto"], d["fe"], d["fv"], d["n_etiquetas"]]
+        fila = [d["lote_final"], d["producto"], d["fe"], d["fv"], cantidades.get(d["id"], d["n_etiquetas"])]
         if historial:
             fila += ["Subreceta" if d["es_subreceta"] else "Pan", ESTADOS_TEXTO.get(d["estado"], d["estado"])]
         salida.append(fila)
@@ -3669,6 +4007,85 @@ def nombre_etiquetas():
     if desde is None:
         return "lotes_historial_%s" % dt.date.today().isoformat()
     return "etiquetas_%s" % desde if desde == hasta else "etiquetas_%s_a_%s" % (desde, hasta)
+
+
+@app.post("/api/etiquetas/impresion")
+def api_etiquetas_impresion():
+    """Se imprimieron etiquetas desde la pantalla Etiquetas. Lo impreso queda como los paquetes del lote en el
+    congelador (1 etiqueta = 1 paquete), salvo una reimpresion, que solo se anota en el historial."""
+    con = db()
+    d = request.get_json(force=True) or {}
+    persona = persona_de(d)
+    reimp = bool(d.get("reimpresion"))
+    items = d.get("items") or []
+    if not items:
+        raise ErrorApi("Marca al menos un lote.")
+    hechos = []
+    for it in items:
+        try:
+            pid, n = int(it.get("id")), int(str(it.get("cantidad")).strip())
+        except (TypeError, ValueError):
+            raise ErrorApi("La cantidad de etiquetas debe ser un número entero.")
+        if n <= 0:
+            raise ErrorApi("La cantidad de etiquetas debe ser mayor que 0.")
+        p = con.execute("SELECT id, lote_final, estado, COALESCE(n_etiquetas,0) AS n, paquetes_confirmados_en FROM producciones WHERE id=?",
+                        (pid,)).fetchone()
+        if not p or p["estado"] == "anulada":
+            raise ErrorApi("Ese lote no existe o está anulado.")
+        if p["estado"] != "completa":
+            raise ErrorApi("El lote %s todavía no tiene la hoja de producción completa: ciérrala antes de imprimir sus etiquetas."
+                           % p["lote_final"])
+        if not reimp:
+            if p["paquetes_confirmados_en"]:
+                raise ErrorApi("El lote %s ya se imprimió con %d paquetes. Para otra copia usa «Reimpresión»; "
+                               "si el número está mal, usa «Corregir»." % (p["lote_final"], p["n"]))
+            con.execute("UPDATE producciones SET n_etiquetas=?, paquetes_confirmados_en=? WHERE id=?", (n, ahora(), pid))
+        hechos.append("%s: %d" % (p["lote_final"], n))
+    anotar(con, persona, "ETIQUETAS_REIMPRESAS" if reimp else "ETIQUETAS_IMPRESAS",
+           ("Etiquetas reimpresas (no cambian los paquetes): " if reimp else "Paquetes: ") + ", ".join(hechos)
+           + (" (+1 etiqueta por lote para el cuaderno)" if d.get("cuaderno") else ""))
+    con.commit()
+    return jsonify(ok=True)
+
+
+def paquetes_salidos(con, pid):
+    """Paquetes de un lote que ya salieron del congelador (despachos y bajas no anulados)."""
+    return con.execute(
+        """SELECT COALESCE((SELECT SUM(dl.paquetes) FROM despacho_lineas dl JOIN despachos x ON x.id=dl.despacho_id
+                             WHERE dl.produccion_id=? AND x.anulado=0),0)
+                + COALESCE((SELECT SUM(b.paquetes) FROM bajas_congelador b WHERE b.produccion_id=? AND b.anulado=0),0)""",
+        (pid, pid)).fetchone()[0]
+
+
+@app.post("/api/etiquetas/corregir")
+def api_etiquetas_corregir():
+    """Corrige los paquetes ya confirmados de un lote (ej. se escribió 48 y eran 49). Queda en el historial con su motivo."""
+    con = db()
+    d = request.get_json(force=True) or {}
+    persona = persona_de(d)
+    try:
+        pid, n = int(d.get("id")), int(str(d.get("cantidad")).strip())
+    except (TypeError, ValueError):
+        raise ErrorApi("Escribe los paquetes solo con números enteros.")
+    motivo = " ".join(str(d.get("motivo") or "").split())
+    if n <= 0:
+        raise ErrorApi("Los paquetes deben ser más que 0.")
+    if not motivo:
+        raise ErrorApi("Escribe el motivo de la corrección (ej. error al escribir).")
+    p = con.execute("SELECT id, lote_final, COALESCE(n_etiquetas,0) AS n, paquetes_confirmados_en FROM producciones WHERE id=?",
+                    (pid,)).fetchone()
+    if not p or not p["paquetes_confirmados_en"]:
+        raise ErrorApi("Ese lote todavía no tiene paquetes confirmados.")
+    if n == p["n"]:
+        raise ErrorApi("Es el mismo número que ya tenía (%d)." % n)
+    salio = paquetes_salidos(con, pid)
+    if n < salio:
+        raise ErrorApi("Del lote %s ya salieron %d paquetes del congelador: no pueden ser menos." % (p["lote_final"], salio))
+    con.execute("UPDATE producciones SET n_etiquetas=? WHERE id=?", (n, pid))
+    anotar(con, persona, "PAQUETES_CORREGIDOS", "%s: de %d a %d paquetes. Motivo: %s" % (p["lote_final"], p["n"], n, motivo),
+           produccion_id=pid)
+    con.commit()
+    return jsonify(ok=True, cantidad=n)
 
 
 @app.get("/api/etiquetas.csv")
@@ -3728,7 +4145,11 @@ def congelador(con, solo_id=None):
         """SELECT p.id AS produccion_id, p.producto, p.producto_id, p.lote_final, p.fecha, p.vence, p.unidades, p.estado,
                   COALESCE(p.n_etiquetas,0) AS paquetes, pr.vida_util_meses, pr.vida_util_dias, %s AS saldo
            FROM producciones p JOIN productos pr ON pr.id=p.producto_id
-           WHERE p.estado='completa' AND pr.produce_ingrediente_id IS NULL AND %s""" % (SALDO_SQL, donde),
+           WHERE p.estado='completa' AND pr.produce_ingrediente_id IS NULL
+             AND (p.paquetes_confirmados_en IS NOT NULL
+                  OR EXISTS(SELECT 1 FROM despacho_lineas dl WHERE dl.produccion_id=p.id)
+                  OR EXISTS(SELECT 1 FROM bajas_congelador b WHERE b.produccion_id=p.id))
+             AND %s""" % (SALDO_SQL, donde),
         (solo_id,) if solo_id else ()))
     salida = []
     for d in datos:
@@ -3897,12 +4318,15 @@ def api_despacho_nuevo():
     if not items:
         raise ErrorApi("Escribe cuántos paquetes salen de al menos un lote.")
     obs = " ".join(str(d.get("observaciones") or "").split())
-    nuevo = con.execute("INSERT INTO despachos(destino_id,fecha,fecha_hora,persona,observaciones) VALUES(?,?,?,?,?)",
-                        (destino["id"], fecha, ahora(), persona, obs)).lastrowid
+    despachador = " ".join(str(d.get("despachado_por") or "").upper().split())
+    if not despachador:
+        raise ErrorApi("Escribe quién despacha.")
+    nuevo = con.execute("INSERT INTO despachos(destino_id,fecha,fecha_hora,persona,observaciones,despachado_por) VALUES(?,?,?,?,?,?)",
+                        (destino["id"], fecha, ahora(), persona, obs, despachador)).lastrowid
     for lote, n in items:
         con.execute("INSERT INTO despacho_lineas(despacho_id,produccion_id,paquetes) VALUES(?,?,?)", (nuevo, lote["produccion_id"], n))
-        anotar(con, persona, "DESPACHO", "Despacho N.º %d a %s: %d paquete(s) de %s lote %s" % (
-            nuevo, destino["nombre"], n, lote["producto"], lote["lote_final"]), produccion_id=lote["produccion_id"])
+        anotar(con, persona, "DESPACHO", "Despacho N.º %d a %s: %d paquete(s) de %s lote %s. Despachó: %s" % (
+            nuevo, destino["nombre"], n, lote["producto"], lote["lote_final"], despachador), produccion_id=lote["produccion_id"])
     con.commit()
     return jsonify(despachos_detalle(con, "d.id=?", (nuevo,))[0])
 
@@ -3922,6 +4346,244 @@ def api_despacho(despacho_id):
     if not datos:
         raise ErrorApi("No se encontró el despacho.", 404)
     return jsonify(datos[0])
+
+
+# ----------------------------------------------------------------------------
+# PDF sencillo (sin librerias extra): Helvetica, lineas, rectangulos y el logo. Se usa para la guia de despacho.
+# ----------------------------------------------------------------------------
+ANCHOS_HELVETICA = {
+    "F1": [278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,278,278,584,584,584,556,1015,667,667,722,722,667,611,778,722,278,500,667,556,833,722,778,667,778,722,667,611,722,667,944,667,667,611,278,278,278,469,556,333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,556,556,333,500,278,556,500,722,500,500,500,334,260,334,584,761,556,761,222,556,333,1000,556,556,333,1000,667,333,1000,761,611,761,761,222,222,333,333,350,556,1000,333,1000,500,333,944,761,500,667,278,333,556,556,556,556,260,556,333,737,370,556,584,333,737,333,400,584,333,333,333,556,537,278,333,333,365,556,834,834,834,611,667,667,667,667,667,667,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,500,556,556,556,556,278,278,278,278,556,556,556,556,556,556,556,584,611,556,556,556,556,500,556,500],
+    "F2": [278,333,474,556,556,889,722,238,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,333,333,584,584,584,611,975,722,722,722,722,667,611,778,722,278,556,722,611,833,722,778,667,778,722,667,611,722,667,944,667,667,611,333,278,333,584,556,333,556,611,556,611,556,333,611,611,278,278,556,278,889,611,611,611,611,389,556,333,611,556,778,556,556,500,389,280,389,584,761,556,761,278,556,500,1000,556,556,333,1000,667,333,1000,761,611,761,761,278,278,500,500,350,556,1000,333,1000,556,333,944,761,500,667,278,333,556,556,556,556,280,556,333,737,370,556,584,333,737,333,400,584,333,333,333,611,556,278,333,333,365,556,834,834,834,611,722,722,722,722,722,722,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,556,556,556,556,556,278,278,278,278,611,611,611,611,611,611,611,584,611,611,611,611,611,556,611,556],
+}
+
+
+def ancho_texto(texto, tam, negrita=False):
+    tabla = ANCHOS_HELVETICA["F2" if negrita else "F1"]
+    total = 0
+    for ch in str(texto):
+        try:
+            b = ch.encode("cp1252")[0]
+        except (UnicodeEncodeError, IndexError):
+            b = ord("?")
+        total += tabla[b - 32] if b >= 32 else 0
+    return total * tam / 1000.0
+
+
+def partir_texto(texto, tam, ancho, negrita=False):
+    """Parte un texto en lineas que caben en el ancho dado."""
+    lineas = []
+    for parrafo in str(texto or "").split("\n"):
+        actual = ""
+        for palabra in parrafo.split():
+            prueba = (actual + " " + palabra).strip()
+            if ancho_texto(prueba, tam, negrita) <= ancho or not actual:
+                actual = prueba
+            else:
+                lineas.append(actual)
+                actual = palabra
+        lineas.append(actual)
+    return lineas or [""]
+
+
+class PdfSimple:
+    """Una pagina A4 (595 x 842 puntos). Coordenadas desde arriba a la izquierda, en puntos."""
+    ANCHO, ALTO = 595.28, 841.89
+
+    def __init__(self):
+        self.ops = []
+        self.imagenes = []
+
+    @staticmethod
+    def _esc(t):
+        b = str(t).encode("cp1252", "replace")
+        return b.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+
+    def _y(self, y):
+        return self.ALTO - y
+
+    def color(self, rgb, relleno=True):
+        r, g, b = rgb
+        self.ops.append(("%.3f %.3f %.3f %s" % (r / 255, g / 255, b / 255, "rg" if relleno else "RG")).encode())
+
+    def texto(self, x, y, t, tam=10, negrita=False, rgb=(20, 24, 33), alinear="izq"):
+        """y = linea base."""
+        if alinear == "centro":
+            x -= ancho_texto(t, tam, negrita) / 2
+        elif alinear == "der":
+            x -= ancho_texto(t, tam, negrita)
+        self.color(rgb)
+        self.ops.append(b"BT /" + (b"F2" if negrita else b"F1") + (" %.2f Tf %.2f %.2f Td (" % (tam, x, self._y(y))).encode()
+                        + self._esc(t) + b") Tj ET")
+
+    def linea(self, x1, y1, x2, y2, grosor=0.7, rgb=(40, 48, 70)):
+        self.color(rgb, False)
+        self.ops.append(("%.2f w %.2f %.2f m %.2f %.2f l S" % (grosor, x1, self._y(y1), x2, self._y(y2))).encode())
+
+    def rect(self, x, y, w, hgt, relleno=None, borde=(40, 48, 70), grosor=0.7):
+        if relleno:
+            self.color(relleno)
+        if borde:
+            self.color(borde, False)
+        op = "B" if relleno and borde else "f" if relleno else "S"
+        self.ops.append(("%.2f w %.2f %.2f %.2f %.2f re %s" % (grosor, x, self._y(y + hgt), w, hgt, op)).encode())
+
+    def imagen(self, ruta, x, y, w, hgt):
+        from PIL import Image as Pil
+        foto = Pil.open(ruta)
+        if foto.mode in ("RGBA", "LA", "P"):
+            fondo = Pil.new("RGB", foto.size, (255, 255, 255))
+            fondo.paste(foto.convert("RGBA"), mask=foto.convert("RGBA").split()[3])
+            foto = fondo
+        foto = foto.convert("RGB")
+        datos = io.BytesIO()
+        foto.save(datos, "JPEG", quality=92)
+        nombre = "Im%d" % (len(self.imagenes) + 1)
+        self.imagenes.append((nombre, foto.size, datos.getvalue()))
+        self.ops.append(("q %.2f 0 0 %.2f %.2f %.2f cm /%s Do Q" % (w, hgt, x, self._y(y + hgt), nombre)).encode())
+
+    def bytes(self, titulo="Documento"):
+        objetos = []
+
+        def nuevo(contenido):
+            objetos.append(contenido)
+            return len(objetos)
+
+        f1 = nuevo(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+        f2 = nuevo(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
+        imgs = {}
+        for nombre, (w, hgt), datos in self.imagenes:
+            imgs[nombre] = nuevo(("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB "
+                                  "/BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n" % (w, hgt, len(datos))).encode()
+                                 + datos + b"\nendstream")
+        flujo = b"\n".join(self.ops)
+        cont = nuevo(("<< /Length %d >>\nstream\n" % len(flujo)).encode() + flujo + b"\nendstream")
+        recursos = "<< /Font << /F1 %d 0 R /F2 %d 0 R >> /XObject << %s >> >>" % (
+            f1, f2, " ".join("/%s %d 0 R" % (n, i) for n, i in imgs.items()))
+        paginas_id = len(objetos) + 2
+        pagina = nuevo(("<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %.2f %.2f] /Resources %s /Contents %d 0 R >>"
+                        % (paginas_id, self.ANCHO, self.ALTO, recursos, cont)).encode())
+        nuevo(("<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % pagina).encode())
+        info = nuevo(b"<< /Title (" + self._esc(titulo) + b") /Producer (TrazaPanUSFQ) >>")
+        catalogo = nuevo(("<< /Type /Catalog /Pages %d 0 R >>" % paginas_id).encode())
+        salida = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        posiciones = []
+        for i, obj in enumerate(objetos, 1):
+            posiciones.append(len(salida))
+            salida += ("%d 0 obj\n" % i).encode() + obj + b"\nendobj\n"
+        xref = len(salida)
+        salida += ("xref\n0 %d\n0000000000 65535 f \n" % (len(objetos) + 1)).encode()
+        for p in posiciones:
+            salida += ("%010d 00000 n \n" % p).encode()
+        salida += ("trailer\n<< /Size %d /Root %d 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+                   % (len(objetos) + 1, catalogo, info, xref)).encode()
+        return bytes(salida)
+
+
+def pdf_guia_despacho(d):
+    """Guia de despacho en PDF (A4), con el mismo contenido de la guia impresa."""
+    pdf = PdfSimple()
+    M, W = 40, PdfSimple.ANCHO - 80
+    oscuro, gris, suave = (43, 53, 80), (110, 116, 130), (243, 244, 246)
+    fecha = lambda t: dt.date.fromisoformat(str(t)[:10]).strftime("%d/%m/%Y") if t else "—"
+    # Cabecera: logo | titulo | numero
+    y = 40
+    pdf.rect(M, y, W, 64)
+    pdf.linea(M + 165, y, M + 165, y + 64)
+    pdf.linea(M + W - 120, y, M + W - 120, y + 64)
+    logo = os.path.join(BASE, "static", "logo.png")
+    if os.path.isfile(logo):
+        pdf.imagen(logo, M + 12, y + 14, 141, 34)
+    cx = M + 165 + (W - 285) / 2
+    pdf.texto(cx, y + 26, "GUÍA DE DESPACHO", 8, True, gris, "centro")
+    pdf.texto(cx, y + 46, "Pan congelado", 17, True, oscuro, "centro")
+    pdf.texto(M + W - 60, y + 26, "NÚMERO", 8, True, gris, "centro")
+    pdf.texto(M + W - 60, y + 48, "%04d" % d["id"], 20, True, oscuro, "centro")
+    y += 76
+    if d.get("anulado"):
+        pdf.rect(M, y, W, 22, relleno=(253, 236, 234), borde=(179, 52, 43))
+        pdf.texto(M + 8, y + 15, "DESPACHO ANULADO: %s" % (d.get("motivo_anulacion") or ""), 9.5, True, (179, 52, 43))
+        y += 30
+    # Datos del destino (2 filas x 4 celdas; la direccion ocupa 2)
+    def celda(x, yy, w, etq, valor, alto=40):
+        pdf.rect(x, yy, w, alto)
+        pdf.texto(x + 7, yy + 12, etq.upper(), 6.8, True, gris)
+        lineas = partir_texto(valor or "—", 10, w - 14, True)[:2]
+        for k, ln in enumerate(lineas):
+            pdf.texto(x + 7, yy + 26 + k * 11, ln, 10, True, (20, 24, 33))
+    c = W / 4
+    celda(M, y, c, "Fecha de despacho", fecha(d.get("fecha")))
+    celda(M + c, y, c, "Destino / cliente", d.get("destino"))
+    celda(M + 2 * c, y, c, "RUC / cédula", d.get("ruc"))
+    celda(M + 3 * c, y, c, "Teléfono", d.get("telefono"))
+    y += 40
+    registrado = d.get("fecha_hora") or ""
+    celda(M, y, c, "Persona de contacto", d.get("contacto"))
+    celda(M + c, y, c, "Dirección", d.get("direccion"))
+    celda(M + 2 * c, y, c, "Despachado por", d.get("despachado_por"))
+    celda(M + 3 * c, y, c, "Registrado", (fecha(registrado) + " " + registrado[11:16]).strip() if registrado else "—")
+    y += 56
+    # Lotes despachados
+    pdf.texto(M, y, "LOTES DESPACHADOS", 8.5, True, oscuro)
+    y += 8
+    cols = [("N.º", .07, "centro"), ("Lote", .20, "izq"), ("Producto", .33, "izq"), ("Elaboración", .14, "centro"),
+            ("Vence", .14, "centro"), ("Paquetes", .12, "centro")]
+    xs, x = [], M
+    for _, frac, _ in cols:
+        xs.append(x)
+        x += frac * W
+    alto_cab = 20
+    pdf.rect(M, y, W, alto_cab, relleno=oscuro, borde=oscuro)
+    for (nombre, frac, al), x0 in zip(cols, xs):
+        tx = x0 + frac * W / 2 if al == "centro" else x0 + 7
+        pdf.texto(tx, y + 13.5, nombre.upper(), 7.5, True, (255, 255, 255), al)
+    y += alto_cab
+    for i, li in enumerate(d.get("lineas") or []):
+        prod = partir_texto(li.get("producto"), 9.5, cols[2][1] * W - 14)
+        alto = max(20, 8 + 11 * len(prod))
+        pdf.rect(M, y, W, alto, relleno=suave if i % 2 else (255, 255, 255))
+        valores = [str(i + 1), li.get("lote_final"), None, fecha(li.get("fecha")), fecha(li.get("caducidad")), str(li.get("paquetes"))]
+        for k, ((_, frac, al), x0) in enumerate(zip(cols, xs)):
+            if k:
+                pdf.linea(x0, y, x0, y + alto, 0.5)
+            if k == 2:
+                for j, ln in enumerate(prod):
+                    pdf.texto(x0 + 7, y + 13.5 + j * 11, ln, 9.5)
+            else:
+                tx = x0 + frac * W / 2 if al == "centro" else x0 + 7
+                pdf.texto(tx, y + 13.5, valores[k] or "—", 9.5, k == 1, alinear=al)
+        y += alto
+    pdf.rect(M, y, W, 22, relleno=(255, 255, 255))
+    pdf.linea(xs[5], y, xs[5], y + 22, 0.5)
+    pdf.texto(xs[5] - 8, y + 15, "TOTAL", 9.5, True, alinear="der")
+    pdf.texto(xs[5] + cols[5][1] * W / 2, y + 15, str(d.get("total") or 0), 11, True, oscuro, "centro")
+    y += 36
+    # Observaciones
+    pdf.texto(M, y, "OBSERVACIONES", 8.5, True, oscuro)
+    y += 6
+    obs = partir_texto(d.get("observaciones") or "", 9.5, W - 16)[:5]
+    alto_obs = max(48, 12 + 12 * len(obs))
+    pdf.rect(M, y, W, alto_obs)
+    for j, ln in enumerate(obs):
+        pdf.texto(M + 8, y + 16 + j * 12, ln, 9.5)
+    y += alto_obs + 70
+    # Firmas
+    for x0, titulo, sub in ((M + 20, "Entregado por", d.get("despachado_por") or "PRODUCCIÓN · PANADERÍA"),
+                            (M + W / 2 + 20, "Recibido por", "NOMBRE, FIRMA Y HORA")):
+        pdf.linea(x0, y, x0 + W / 2 - 40, y, 0.8)
+        pdf.texto(x0 + (W / 2 - 40) / 2, y + 15, titulo, 10, True, alinear="centro")
+        pdf.texto(x0 + (W / 2 - 40) / 2, y + 27, sub, 7, True, gris, "centro")
+    pdf.texto(M + W, PdfSimple.ALTO - 30, "TrazaPanUSFQ · San Francisco FoodService · generado el "
+              + dt.datetime.now().strftime("%d/%m/%Y %H:%M"), 7.5, False, gris, "der")
+    return pdf.bytes("Guía de despacho N.º %04d" % d["id"])
+
+
+@app.get("/api/despachos/<int:despacho_id>.pdf")
+def api_despacho_pdf(despacho_id):
+    datos = despachos_detalle(db(), "d.id=?", (despacho_id,))
+    if not datos:
+        raise ErrorApi("No se encontró el despacho.", 404)
+    return Response(pdf_guia_despacho(datos[0]), mimetype="application/pdf",
+                    headers={"Content-Disposition": "inline; filename=guia_despacho_%04d.pdf" % despacho_id})
 
 
 @app.post("/api/despachos/<int:despacho_id>/anular")
@@ -4046,12 +4708,13 @@ def api_despachos_xlsx():
         for li in d["lineas"]:
             filas1.append(["%04d" % d["id"], d_(d["fecha"]), d["destino"], d["ruc"] or None, d["telefono"] or None,
                            li["lote_final"], li["producto"], d_(li["fecha"]), d_(li["caducidad"]), li["paquetes"],
-                           d["persona"], "Anulado: " + d["motivo_anulacion"] if d["anulado"] else "Vigente", d["observaciones"] or None])
+                           d.get("despachado_por") or None, d["persona"], "Anulado: " + d["motivo_anulacion"] if d["anulado"] else "Vigente",
+                           d["observaciones"] or None])
     h1 = libro.active
     h1.title = "Despachos"
     tabla(h1, "Despachos de pan", ["N.º despacho", "Fecha", "Destino", "RUC / cédula", "Teléfono", "Lote", "Producto",
-                                   "Elaboración", "Vence", "Paquetes", "Registrado por", "Estado", "Observaciones"],
-          filas1, (11, 12, 24, 15, 14, 13, 28, 12, 12, 10, 16, 22, 28))
+                                   "Elaboración", "Vence", "Paquetes", "Despachado por", "Registrado por", "Estado", "Observaciones"],
+          filas1, (11, 12, 24, 15, 14, 13, 28, 12, 12, 10, 20, 16, 22, 28))
     h2 = libro.create_sheet("Congelador")
     tabla(h2, "Lotes en el congelador", ["Lote", "Producto", "Elaboración", "Vence", "Paquetes del lote", "Quedan", "Semáforo"],
           [[l["lote_final"], l["producto"], d_(l["fecha"]), d_(l["caducidad"]), l["paquetes"], l["saldo"],
@@ -4210,7 +4873,7 @@ def api_avisos():
     area_aviso = request.args.get("area") or ""
     con = db()
     datos = filas(con.execute(
-        """SELECT a.id, a.texto, a.creado_en, a.creado_por, a.lote_id, a.tipo, l.lote, l.foto, l.origen, l.caducidad, i.nombre AS ingrediente,
+        """SELECT a.id, a.texto, a.creado_en, a.creado_por, a.lote_id, a.tipo, l.lote, l.foto, l.origen, l.caducidad, l.ingrediente_id, i.nombre AS ingrediente,
                   (SELECT COALESCE(SUM(sc.cantidad),0) FROM salidas_cocina sc WHERE sc.lote_id=l.id) AS tomado_cocina,
                   (SELECT al.contenido FROM alias al WHERE al.ingrediente_id=l.ingrediente_id AND al.en_catalogo=1 AND al.ignorar=0 ORDER BY al.id LIMIT 1) AS contenido,
                   (SELECT al.unidad_contenido FROM alias al WHERE al.ingrediente_id=l.ingrediente_id AND al.en_catalogo=1 AND al.ignorar=0 ORDER BY al.id LIMIT 1) AS unidad_contenido,
@@ -4278,6 +4941,67 @@ def api_aviso_entrada(aviso_id):
                      "porque no aparecía. Ya se descontó de bodega principal: revisa que coincida con lo que hay."
                      % (persona, texto_cant, l["lote"], ing["nombre"]), ahora(), persona, ""))
     anotar(con, persona, "Entrada de lote anotado por cocina", "Lote %s: entraron %s" % (l["lote"], texto_cant), lote_id=l["id"])
+    con.commit()
+    return jsonify(ok=True)
+
+
+def aviso_de_lote_manual(con, aviso_id):
+    a = con.execute("SELECT * FROM avisos WHERE id=? AND resuelto_en IS NULL", (aviso_id,)).fetchone()
+    if not a or not a["lote_id"]:
+        raise ErrorApi("Ese aviso ya se resolvió.")
+    lote = un_lote(con, a["lote_id"])
+    if lote["origen"] != "manual" or con.execute("SELECT 1 FROM recepciones WHERE lote_id=? AND anulado=0", (lote["id"],)).fetchone():
+        raise ErrorApi("Ese lote ya tiene recepción en bodega principal.")
+    return a, lote
+
+
+@app.post("/api/avisos/<int:aviso_id>/es-de-principal")
+def api_aviso_es_de_principal(aviso_id):
+    """Bodega principal confirma que el lote anotado a mano es uno que ya tenía registrado (con otro código o el mismo):
+    se unen y lo que se llevaron se descuenta de bodega principal."""
+    d = cuerpo()
+    persona = persona_de(d)
+    con = db()
+    a, manual = aviso_de_lote_manual(con, aviso_id)
+    destino = con.execute("SELECT id FROM lotes WHERE id=? AND ingrediente_id=?", (d.get("lote_id"), manual["ingrediente_id"])).fetchone()
+    if not destino or destino["id"] == manual["id"]:
+        raise ErrorApi("Elige el lote de bodega principal.")
+    if not con.execute("SELECT 1 FROM recepciones WHERE lote_id=? AND anulado=0", (destino["id"],)).fetchone():
+        raise ErrorApi("Ese lote no tiene recepción en bodega principal.")
+    llevaron = manual["trasladado"] or 0
+    unir_lotes(con, manual["id"], destino["id"], persona)
+    l = un_lote(con, destino["id"])
+    if l.get("disponible") is not None:
+        con.execute("UPDATE lotes SET principal_vacio=? WHERE id=?", (0 if l["disponible"] > 1e-9 else 1, destino["id"]))
+        if l["disponible"] < -1e-9:
+            con.execute("UPDATE lotes SET revisar=1, nota=TRIM(COALESCE(nota,'') || ' ' || ?) WHERE id=?",
+                        ("Se llevaron más de lo que bodega principal tenía registrado: revisar cantidades.", destino["id"]))
+    texto_cant = cantidad_texto(llevaron, l) if l.get("empaque") else fmt(llevaron)
+    comentario = "Era el lote %s de bodega principal: se descontaron %s%s." % (
+        l["lote"], texto_cant, "; quedan %s" % cantidad_texto(max(l["disponible"], 0), l) if l.get("disponible") is not None and l.get("empaque") else "")
+    con.execute("UPDATE avisos SET resuelto_en=?, resuelto_por=?, comentario=? WHERE lote_id=? AND area='bodega' AND resuelto_en IS NULL",
+                (ahora(), persona, comentario, destino["id"]))
+    anotar(con, persona, "AVISO_ES_DE_PRINCIPAL", "%s: el lote %s anotado a mano era el %s de bodega principal (%s)" % (
+        l["ingrediente"], manual["lote"], l["lote"], texto_cant), destino["id"])
+    con.commit()
+    return jsonify(ok=True, comentario=comentario)
+
+
+@app.post("/api/avisos/<int:aviso_id>/sin-principal")
+def api_aviso_sin_principal(aviso_id):
+    """Bodega principal confirma que ese lote nunca pasó por allí (no es que olvidaron registrarlo): queda solo lo que
+    anotaron en bodega secundaria o cocina, con esta nota."""
+    d = cuerpo()
+    persona = persona_de(d)
+    con = db()
+    a, manual = aviso_de_lote_manual(con, aviso_id)
+    comentario = " ".join(str(d.get("comentario") or "").split())
+    if len(comentario) < 3:
+        raise ErrorApi("Escribe qué pasó (por ejemplo, de dónde vino).")
+    nota = "Bodega principal confirmó que este lote no pasó por bodega principal: %s" % comentario
+    con.execute("UPDATE lotes SET revisar=0, nota=TRIM(COALESCE(nota,'') || ' ' || ?) WHERE id=?", (nota, manual["id"]))
+    con.execute("UPDATE avisos SET resuelto_en=?, resuelto_por=?, comentario=? WHERE id=?", (ahora(), persona, nota, aviso_id))
+    anotar(con, persona, "AVISO_SIN_PRINCIPAL", "%s lote %s: %s" % (manual["ingrediente"], manual["lote"], nota), manual["id"])
     con.commit()
     return jsonify(ok=True)
 
@@ -4617,6 +5341,122 @@ def api_respaldo():
     origen.close()
     return send_file(destino, as_attachment=True,
                      download_name="trazabilidad_%s.db" % dt.datetime.now().strftime("%Y%m%d_%H%M"))
+
+
+@app.get("/api/respaldo-completo")
+def api_respaldo_completo():
+    """Un .zip con TODO para pasar la app a otra computadora: la base de datos y todas las fotos."""
+    import tempfile
+    import zipfile
+    os.makedirs(RESPALDOS, exist_ok=True)
+    base = os.path.join(RESPALDOS, "descarga.db")
+    origen, copia = sqlite3.connect(DB), sqlite3.connect(base)
+    origen.backup(copia)
+    copia.close()
+    origen.close()
+    archivo = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, dir=RESPALDOS)
+    archivo.close()
+    with zipfile.ZipFile(archivo.name, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(base, "trazabilidad.db")
+        for raiz, _carpetas, nombres in os.walk(FOTOS):
+            for nombre in nombres:
+                ruta = os.path.join(raiz, nombre)
+                z.write(ruta, "fotos/" + os.path.relpath(ruta, FOTOS).replace(os.sep, "/"), zipfile.ZIP_STORED)
+    with open(archivo.name, "rb") as f:
+        datos = io.BytesIO(f.read())
+    os.remove(archivo.name)
+    return send_file(datos, as_attachment=True, mimetype="application/zip",
+                     download_name="TrazaPan_respaldo_completo_%s.zip" % dt.datetime.now().strftime("%Y%m%d_%H%M"))
+
+
+@app.post("/api/admin/cargar-respaldo")
+def api_cargar_respaldo():
+    """Carga en esta computadora un respaldo completo (.zip con base y fotos) o solo la base (.db).
+    Reemplaza los datos actuales (antes se guarda una copia en datos/respaldos) y agrega las fotos que falten."""
+    import tempfile
+    import zipfile
+    con = db()
+    if claves_activas(con) and session.get("area") != "produccion":
+        raise ErrorApi("Solo el área de Producción puede cargar un respaldo.", 403)
+    if (request.args.get("confirmacion") or "").strip().upper() != "CARGAR":
+        raise ErrorApi("Escribe CARGAR para confirmar.")
+    contenido = request.get_data()
+    if not contenido:
+        raise ErrorApi("Elige el archivo del respaldo.")
+    persona = persona_de(request.args)
+    temporal = tempfile.NamedTemporaryFile(suffix=".db", delete=False, dir=RESPALDOS)
+    temporal.close()
+    fotos_nuevas = 0
+    try:
+        es_zip = contenido[:4] == b"PK\x03\x04"
+        if es_zip:
+            try:
+                z = zipfile.ZipFile(io.BytesIO(contenido))
+            except zipfile.BadZipFile:
+                raise ErrorApi("El archivo .zip está dañado.")
+            nombres = z.namelist()
+            base_en_zip = next((n for n in nombres if n.replace("\\", "/").split("/")[-1] == "trazabilidad.db"), None)
+            if not base_en_zip:
+                raise ErrorApi("Ese .zip no tiene la base de datos (trazabilidad.db). Usa «Descargar copia completa».")
+            with open(temporal.name, "wb") as f:
+                f.write(z.read(base_en_zip))
+        else:
+            with open(temporal.name, "wb") as f:
+                f.write(contenido)
+        # Que de verdad sea una base de TrazaPan antes de tocar nada.
+        try:
+            prueba = sqlite3.connect(temporal.name)
+            tablas = {f[0] for f in prueba.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            prueba.close()
+        except sqlite3.DatabaseError:
+            raise ErrorApi("Ese archivo no es un respaldo de TrazaPan.")
+        if not {"recepciones", "lotes", "producciones", "ingredientes"} <= tablas:
+            raise ErrorApi("Ese archivo no es un respaldo de TrazaPan.")
+        # Copia de lo que hay ahora, por si acaso.
+        os.makedirs(RESPALDOS, exist_ok=True)
+        copia_nombre = "antes_de_cargar_respaldo_%s.db" % dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        n_copia = 1
+        while os.path.exists(os.path.join(RESPALDOS, copia_nombre)):     # nunca se pisa una copia anterior
+            n_copia += 1
+            copia_nombre = "antes_de_cargar_respaldo_%s_%d.db" % (dt.datetime.now().strftime("%Y%m%d_%H%M%S"), n_copia)
+        con.commit()
+        copia = sqlite3.connect(os.path.join(RESPALDOS, copia_nombre))
+        con.backup(copia)
+        copia.close()
+        # Reemplaza el contenido de la base actual por el del respaldo.
+        nueva = sqlite3.connect(temporal.name)
+        nueva.backup(con)
+        nueva.close()
+        # Fotos: se agregan las que falten (no se borra ninguna de esta computadora).
+        if es_zip:
+            raiz_fotos = os.path.realpath(FOTOS)
+            for info in z.infolist():
+                nombre = info.filename.replace("\\", "/")
+                if info.is_dir() or "/fotos/" not in "/" + nombre:
+                    continue
+                relativo = nombre.split("fotos/", 1)[1]
+                destino = os.path.realpath(os.path.join(FOTOS, relativo))
+                if not destino.startswith(raiz_fotos + os.sep):
+                    continue                                    # rutas raras: se ignoran
+                if os.path.exists(destino) and os.path.getsize(destino) == info.file_size:
+                    continue
+                os.makedirs(os.path.dirname(destino), exist_ok=True)
+                with open(destino, "wb") as f:
+                    f.write(z.read(info))
+                fotos_nuevas += 1
+    finally:
+        try:
+            os.remove(temporal.name)
+        except OSError:
+            pass
+    preparar_base()                 # pone al día la base cargada (si viene de una versión anterior de la app)
+    con = conectar()
+    anotar(con, persona, "RESPALDO CARGADO", "Se cargó un respaldo%s. Copia de lo anterior en respaldos/%s" %
+           (" completo (%d fotos nuevas)" % fotos_nuevas if fotos_nuevas else "", copia_nombre))
+    cuentas = {t: con.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0] for t in ("recepciones", "lotes", "producciones")}
+    con.commit()
+    con.close()
+    return jsonify(ok=True, copia=copia_nombre, fotos_nuevas=fotos_nuevas, **cuentas)
 
 
 @app.after_request
